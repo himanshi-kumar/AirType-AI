@@ -1,309 +1,351 @@
 """
-keyboard.py — Sprint 3: Virtual Keyboard with Hover + Typing
+keyboard.py — Sprint 4: Virtual Keyboard with Hover, Typing, and Word Suggestions
 
-WHAT'S NEW IN SPRINT 3
+WHAT'S NEW IN SPRINT 4
 -----------------------
-Sprint 1.2: Key class (draw a single key)
-Sprint 1.3: Keyboard class (auto-generate all rows)
-Sprint 3:   Hover detection (is a finger over a key?)
-            Visual feedback (highlight the hovered key)
-            Typing engine (register a keypress, build typed text)
-            Backspace support
-            Typed text display on screen
+Sprint 3: Hover detection, green highlight, pinch-to-type, text display
+Sprint 4: Suggestion bar — 3 predicted word buttons above the text display
+          select_suggestion() — auto-complete + replace partial word
+          Layout upgraded to 1280×720 (larger, cleaner)
 
-DESIGN PHILOSOPHY
------------------
-The Keyboard class does NOT know about hands or gestures.
-It only answers two questions:
-    1. "Which key is my finger currently over?" (get_hovered_key)
-    2. "A click happened — type it!" (register_click)
-
-The caller (main.py) bridges the gap:
-    finger_pos → keyboard.get_hovered_key() → pinch? → keyboard.register_click()
+LAYOUT (1280 × 720 frame)
+--------------------------
+y=0-360:    Webcam feed (hand tracking)
+y=365-405:  Suggestion bar  (3 word prediction boxes)
+y=410-450:  Typed text display
+y=455-505:  QWERTY row
+y=512-562:  ASDFG row
+y=569-619:  ZXCVB row
+y=626-676:  SPACE / BACK row
 """
 
 import cv2
 
 
-# ── Visual constants ──────────────────────────────────────────────────────────
+# ── Layout constants (calibrated for 1280×720) ────────────────────────────────
 
-# Key dimensions in pixels
-KEY_WIDTH = 60
-KEY_HEIGHT = 60
-GAP = 10                       # spacing between keys
+KEY_WIDTH  = 58     # pixel width of one key
+KEY_HEIGHT = 50     # pixel height of one key
+GAP        = 8      # gap between adjacent keys
 
-# Start position: top-left corner of the keyboard on screen
-START_X = 50
-START_Y = 400                  # pushed to bottom of frame (frame is typically 480px tall)
+START_X = 50        # left margin of the keyboard canvas
+START_Y = 455       # y-position of the top key row
 
-# Total keyboard canvas width (used for centering rows)
-KEYBOARD_CANVAS_WIDTH = 780
+KEYBOARD_CANVAS_WIDTH = 1180   # total width the keyboard occupies (1280 - 2×50)
 
-# Colors (BGR format — remember OpenCV is BGR, not RGB)
-COLOR_KEY_NORMAL    = (40, 40, 40)       # dark grey fill
-COLOR_KEY_HOVER     = (0, 180, 60)       # bright green fill when finger is over key
-COLOR_KEY_BORDER    = (180, 180, 180)    # light grey border
-COLOR_KEY_BORDER_HV = (255, 255, 255)    # white border when hovered
-COLOR_TEXT_NORMAL   = (255, 255, 255)    # white text
-COLOR_TEXT_HOVER    = (255, 255, 255)    # white text on hover
-COLOR_TYPED_TEXT    = (0, 255, 150)      # green for the typed word display
+# Suggestion bar geometry
+SUGGESTION_BAR_Y1  = 365   # top edge of suggestion bar
+SUGGESTION_BAR_Y2  = 405   # bottom edge of suggestion bar
+SUGGESTION_PADDING = 10    # internal padding inside each suggestion box
+SUGGESTION_GAP     = 12    # gap between suggestion boxes
+
+# Text display bar geometry (sits between suggestion bar and keyboard)
+TEXT_BAR_Y1 = 412
+TEXT_BAR_Y2 = 450
+
+# ── Colors (BGR) ──────────────────────────────────────────────────────────────
+COLOR_KEY_NORMAL      = (35,  35,  35)    # very dark grey
+COLOR_KEY_HOVER       = (0,  160,  60)    # green
+COLOR_KEY_BORDER      = (120, 120, 120)   # grey border
+COLOR_KEY_BORDER_HV   = (255, 255, 255)   # white border (hovered)
+COLOR_TEXT_NORMAL     = (255, 255, 255)
+COLOR_TEXT_HOVER      = (255, 255, 255)
+COLOR_TYPED_TEXT      = (0,  255, 150)    # bright green for typed text
+COLOR_SUGGESTION_BG   = (20,  20,  80)    # dark blue for suggestion box
+COLOR_SUGGESTION_HV   = (60,  60, 180)    # lighter blue when hovered
+COLOR_SUGGESTION_TEXT = (200, 220, 255)   # light blue text
+COLOR_SUGGESTION_HV_T = (255, 255, 255)   # white text when hovered
 
 
 class Key:
     """
-    Represents a single keyboard key — its position, label, and how to draw itself.
+    Represents one key on the virtual keyboard.
 
-    SINGLE RESPONSIBILITY
-    ---------------------
-    Key knows:
-      - where it lives on screen (x, y, width, height)
-      - what letter it represents (label)
-      - how to draw itself in normal or hovered state
-
-    Key does NOT know:
-      - whether a finger is over it (that's Keyboard.get_hovered_key)
-      - what happens when clicked (that's Keyboard.register_click)
-      - anything about MediaPipe or gestures
-
-    This separation means we can change the drawing style without touching
-    any gesture or detection code, and vice versa.
+    STATELESS DRAWING
+    -----------------
+    Key does not store hover state — it's passed at draw time.
+    This means Key objects never go "stale" between frames.
+    Each frame = a fresh decision about what to draw.
 
     ATTRIBUTES
     ----------
-    label  : str     The letter shown on the key (e.g. 'Q')
-    x      : int     Left edge pixel position
-    y      : int     Top edge pixel position
-    width  : int     Key width in pixels
-    height : int     Key height in pixels
+    label  : str    Letter shown on the key
+    x,y    : int    Top-left corner pixel position
+    width  : int    Key width in pixels
+    height : int    Key height in pixels
     """
 
     def __init__(self, label: str, x: int, y: int, width: int, height: int):
-        self.label = label
-        self.x = x
-        self.y = y
-        self.width = width
+        self.label  = label
+        self.x      = x
+        self.y      = y
+        self.width  = width
         self.height = height
 
     def draw(self, frame, hovered: bool = False):
         """
-        Draw this key onto the frame.
+        Draw this key using the painter's algorithm: fill → border → text.
 
-        WHY hovered IS A PARAMETER (not stored on self)
-        ------------------------------------------------
-        Hover state changes 30 times per second based on finger position.
-        Storing it on the Key object would mean we mutate Key state every frame,
-        which makes the code harder to reason about.
-        Instead, we pass it as a parameter at draw time — Key stays stateless.
-        Stateless objects are easier to test and debug.
+        PAINTER'S ALGORITHM
+        --------------------
+        Named after physical oil painting: distant objects first, foreground last.
+        Here:  background fill → border → letter label
+        Each layer overwrites pixels beneath it.
 
-        DRAWING ORDER (painter's algorithm)
-        ------------------------------------
-        1. Filled rectangle (background)
-        2. Border rectangle (outline)
-        3. Text label
+        TEXT CENTERING MATH
+        --------------------
+        cv2.getTextSize() returns the bounding box of the text string.
+        We use it to compute the pixel offset that centers text inside the key:
 
-        We draw background FIRST, then border on top, then text on top of that.
-        This is the "painter's algorithm": paint background, then foreground.
-        Same principle used in 3D rendering engines.
+            text_x = key.x + (key.width  - text_width)  // 2
+            text_y = key.y + (key.height + text_height) // 2
 
-        Parameters
-        ----------
-        frame   : np.ndarray   The BGR frame to draw on (mutated in place).
-        hovered : bool         True if the index finger is over this key.
+        Note: cv2 y-coordinates measure from TOP, but putText baseline
+        is at the BOTTOM of the characters. That's why we ADD text_height
+        for y but SUBTRACT text_width for x — they measure different things.
         """
-        fill_color   = COLOR_KEY_HOVER   if hovered else COLOR_KEY_NORMAL
-        border_color = COLOR_KEY_BORDER_HV if hovered else COLOR_KEY_BORDER
+        fill   = COLOR_KEY_HOVER   if hovered else COLOR_KEY_NORMAL
+        border = COLOR_KEY_BORDER_HV if hovered else COLOR_KEY_BORDER
+        tl     = (self.x,              self.y)
+        br     = (self.x + self.width, self.y + self.height)
 
-        top_left     = (self.x, self.y)
-        bottom_right = (self.x + self.width, self.y + self.height)
+        cv2.rectangle(frame, tl, br, fill,   -1)    # fill
+        cv2.rectangle(frame, tl, br, border,  2)    # border
 
-        # 1. Fill background
-        cv2.rectangle(frame, top_left, bottom_right, fill_color, -1)
-
-        # 2. Draw border (thickness=2, not filled)
-        cv2.rectangle(frame, top_left, bottom_right, border_color, 2)
-
-        # 3. Draw letter
-        # Center the text inside the key.
-        # cv2.getTextSize returns (width, height) of the text bounding box.
-        # We use this to mathematically center the text — no guessing.
-        font       = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.9
-        thickness  = 2
-        text_color = COLOR_TEXT_HOVER if hovered else COLOR_TEXT_NORMAL
-
-        (text_w, text_h), _ = cv2.getTextSize(self.label, font, font_scale, thickness)
-        text_x = self.x + (self.width  - text_w) // 2
-        text_y = self.y + (self.height + text_h) // 2
-
-        cv2.putText(frame, self.label, (text_x, text_y), font, font_scale, text_color, thickness)
+        font, fscale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2
+        color = COLOR_TEXT_HOVER if hovered else COLOR_TEXT_NORMAL
+        (tw, th), _ = cv2.getTextSize(self.label, font, fscale, thick)
+        tx = self.x + (self.width  - tw) // 2
+        ty = self.y + (self.height + th) // 2
+        cv2.putText(frame, self.label, (tx, ty), font, fscale, color, thick)
 
     def contains(self, point: tuple) -> bool:
         """
-        Return True if a pixel point falls inside this key's bounding box.
+        AABB collision: is pixel point inside this key's rectangle?
 
-        COLLISION DETECTION (AABB)
-        ---------------------------
-        AABB = Axis-Aligned Bounding Box.
-        A key is a rectangle. A finger position is a point.
-        "Is the point inside the rectangle?" is the collision test.
+        A point (px, py) is inside if:
+            x ≤ px ≤ x+width   AND   y ≤ py ≤ y+height
 
-        Mathematically:
-            point is inside if:
-                key.x ≤ point.x ≤ key.x + key.width
-            AND
-                key.y ≤ point.y ≤ key.y + key.height
-
-        WHY "AXIS-ALIGNED"?
-        --------------------
-        Our keys are always straight (not rotated). Axis-aligned means the
-        rectangle's edges are parallel to the x and y axes. This allows the
-        simple min/max check above. If keys were rotated, we'd need more
-        complex math (SAT — Separating Axis Theorem).
-
-        Parameters
-        ----------
-        point : (int, int)   Pixel (x, y) of the finger tip.
-
-        Returns
-        -------
-        bool   True if the point is inside this key's rectangle.
+        This is called an Axis-Aligned Bounding Box test (AABB).
+        "Axis-aligned" = edges are parallel to x and y axes (no rotation).
+        Time complexity: O(1) — 4 comparisons regardless of anything.
         """
+        if point is None:
+            return False
         px, py = point
-        return (
-            self.x <= px <= self.x + self.width
-            and self.y <= py <= self.y + self.height
-        )
+        return self.x <= px <= self.x + self.width and self.y <= py <= self.y + self.height
+
+
+class SuggestionBox:
+    """
+    A single word-prediction suggestion shown above the keyboard.
+
+    WHY A SEPARATE CLASS (not a Key)?
+    -----------------------------------
+    SuggestionBox and Key look visually similar but are fundamentally different:
+    - Key has a fixed position computed at startup (layout is static)
+    - SuggestionBox has a DYNAMIC label (changes every frame as user types)
+    - SuggestionBox uses different colors to signal "this is a prediction, not a key"
+
+    Using the same Key class would violate Open/Closed Principle:
+    we'd have to add special cases everywhere ("if this is a suggestion key, ...").
+    Separate class = separate responsibility.
+
+    ATTRIBUTES
+    ----------
+    x, y     : int   Top-left corner
+    width    : int   Box width
+    height   : int   Box height (= SUGGESTION_BAR_Y2 - SUGGESTION_BAR_Y1)
+    word     : str   The suggested word (changes every frame)
+    """
+
+    def __init__(self, x: int, y: int, width: int, height: int):
+        self.x      = x
+        self.y      = y
+        self.width  = width
+        self.height = height
+        self.word   = ""    # set by Keyboard.set_suggestions() each frame
+
+    def draw(self, frame, hovered: bool = False):
+        """Draw this suggestion box. Empty word = invisible (skip drawing)."""
+        if not self.word:
+            return
+
+        fill   = COLOR_SUGGESTION_HV  if hovered else COLOR_SUGGESTION_BG
+        tl     = (self.x,              self.y)
+        br     = (self.x + self.width, self.y + self.height)
+
+        # Rounded-rectangle feel via filled rect + border
+        cv2.rectangle(frame, tl, br, fill,         -1)
+        cv2.rectangle(frame, tl, br, (80, 80, 200), 2)
+
+        font, fscale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2
+        color = COLOR_SUGGESTION_HV_T if hovered else COLOR_SUGGESTION_TEXT
+        (tw, th), _ = cv2.getTextSize(self.word, font, fscale, thick)
+        tx = self.x + (self.width  - tw) // 2
+        ty = self.y + (self.height + th) // 2
+        cv2.putText(frame, self.word, (tx, ty), font, fscale, color, thick)
+
+    def contains(self, point: tuple) -> bool:
+        """AABB collision test (same algorithm as Key.contains)."""
+        if point is None or not self.word:
+            return False
+        px, py = point
+        return self.x <= px <= self.x + self.width and self.y <= py <= self.y + self.height
 
 
 class Keyboard:
     """
-    Manages all keys, hover detection, and the typed text buffer.
+    Manages all keys, suggestion boxes, hover detection, and the text buffer.
+
+    DATA FLOW (Sprint 4 addition)
+    ------------------------------
+    main.py calls predictor.get_suggestions(typed_text) → list of words
+    main.py calls keyboard.set_suggestions(words) → updates suggestion boxes
+    keyboard.draw() renders everything including the updated suggestions
+    If pinch fires on a suggestion → keyboard.select_suggestion() auto-completes
 
     ATTRIBUTES
     ----------
-    keys        : list[Key]   All 26 letter keys + SPACE + BACK.
-    typed_text  : str         The string the user has typed so far.
-    hovered_key : Key | None  The key currently under the finger (or None).
+    keys             : list[Key]            28 letter + special keys
+    suggestion_boxes : list[SuggestionBox]  3 suggestion buttons
+    typed_text       : str                  The full typed string
+    hovered_key      : Key | None           Key under the finger (or None)
+    hovered_suggestion : SuggestionBox | None  Suggestion box under finger (or None)
     """
 
     def __init__(self):
-        self.keys: list = []
-        self.typed_text: str = ""
-        self.hovered_key = None
+        self.keys: list            = []
+        self.suggestion_boxes: list = []
+        self.typed_text: str       = ""
+        self.hovered_key           = None
+        self.hovered_suggestion    = None
         self._create_keyboard()
+        self._create_suggestion_bar()
+
+    # ── Setup ─────────────────────────────────────────────────────────────────
 
     def _create_keyboard(self):
         """
-        Auto-generate all key objects from the QWERTY layout.
-
-        WHY NOT HARDCODE POSITIONS?
-        ----------------------------
-        26 keys × 4 parameters = 104 numbers to type manually and maintain.
-        Instead, we define the LAYOUT (which letters, in which rows) and
-        COMPUTE the positions algorithmically.
+        Programmatically generate all Key objects from the QWERTY row strings.
 
         CENTERING ALGORITHM
         --------------------
-        Each row has a different number of keys (10, 9, 7).
-        To center each row within the keyboard canvas:
+        row_pixel_width = n_keys * (KEY_WIDTH + GAP) - GAP
+        row_start_x     = START_X + (KEYBOARD_CANVAS_WIDTH - row_pixel_width) // 2
 
-            total_row_width = n_keys * key_width + (n_keys - 1) * gap
-            x_start = canvas_left + (canvas_width - total_row_width) // 2
-
-        Integer division (//) gives us a whole pixel — no fractional positions.
+        Example for QWERTYUIOP (10 keys):
+            row_width = 10 × (58+8) - 8 = 652
+            row_start_x = 50 + (1180 - 652) // 2 = 50 + 264 = 314
         """
-        rows = [
-            "QWERTYUIOP",   # 10 keys
-            "ASDFGHJKL",    # 9 keys
-            "ZXCVBNM",      # 7 keys
-        ]
+        rows = ["QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"]
 
-        for row_index, row in enumerate(rows):
-            # Vertical position: each row is shifted down by (key_height + gap)
-            y = START_Y + row_index * (KEY_HEIGHT + GAP)
-
-            # Center this row horizontally
-            row_pixel_width = len(row) * (KEY_WIDTH + GAP) - GAP
-            x = START_X + (KEYBOARD_CANVAS_WIDTH - row_pixel_width) // 2
-
+        for row_idx, row in enumerate(rows):
+            y = START_Y + row_idx * (KEY_HEIGHT + GAP)
+            row_w = len(row) * (KEY_WIDTH + GAP) - GAP
+            x = START_X + (KEYBOARD_CANVAS_WIDTH - row_w) // 2
             for letter in row:
                 self.keys.append(Key(letter, x, y, KEY_WIDTH, KEY_HEIGHT))
                 x += KEY_WIDTH + GAP
 
-        # ── Special keys ─────────────────────────────────────────────────────
-        # SPACE bar: wider key, centered below the letter rows
-        space_y   = START_Y + 3 * (KEY_HEIGHT + GAP)
-        space_w   = KEY_WIDTH * 5 + GAP * 4   # same width as 5 normal keys
-        space_x   = START_X + (KEYBOARD_CANVAS_WIDTH - space_w) // 2
-        self.keys.append(Key("SPC", space_x, space_y, space_w, KEY_HEIGHT))
+        # Special keys (SPACE and BACK)
+        sp_y = START_Y + 3 * (KEY_HEIGHT + GAP)
+        sp_w = KEY_WIDTH * 5 + GAP * 4
+        sp_x = START_X + (KEYBOARD_CANVAS_WIDTH - sp_w) // 2
+        self.keys.append(Key("SPC",  sp_x,              sp_y, sp_w,          KEY_HEIGHT))
+        self.keys.append(Key("BACK", sp_x + sp_w + GAP*2, sp_y, KEY_WIDTH*2, KEY_HEIGHT))
 
-        # BACKSPACE: right of SPACE
-        back_x = space_x + space_w + GAP * 2
-        self.keys.append(Key("BACK", back_x, space_y, KEY_WIDTH * 2, KEY_HEIGHT))
+    def _create_suggestion_bar(self, n: int = 3):
+        """
+        Create N evenly spaced SuggestionBox objects.
+
+        WHY COMPUTE WIDTHS DYNAMICALLY?
+        --------------------------------
+        If we ever change n=3 to n=4 suggestions, only this method changes.
+        Everything else adapts automatically. That's the value of computing
+        layout from parameters instead of hardcoding pixel values.
+
+        FORMULA
+        --------
+        total_gap   = (n-1) × SUGGESTION_GAP
+        box_width   = (KEYBOARD_CANVAS_WIDTH - total_gap) / n
+        box_x[i]    = START_X + i × (box_width + SUGGESTION_GAP)
+        """
+        total_gap = (n - 1) * SUGGESTION_GAP
+        box_w = (KEYBOARD_CANVAS_WIDTH - total_gap) // n
+        h = SUGGESTION_BAR_Y2 - SUGGESTION_BAR_Y1
+
+        for i in range(n):
+            x = START_X + i * (box_w + SUGGESTION_GAP)
+            self.suggestion_boxes.append(
+                SuggestionBox(x, SUGGESTION_BAR_Y1, box_w, h)
+            )
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_suggestions(self, words: list):
+        """
+        Update the words shown in the suggestion bar.
+
+        Called by main.py every frame after predictor.get_suggestions().
+        Words that don't fit in the bar are silently ignored.
+
+        WHY SET (not return)?
+        ----------------------
+        The predictor computes suggestions; the keyboard DISPLAYS them.
+        Passing the list in via set() keeps these responsibilities separate:
+            predictor  → knows WHAT to suggest
+            keyboard   → knows HOW to display it
+        """
+        for i, box in enumerate(self.suggestion_boxes):
+            box.word = words[i] if i < len(words) else ""
 
     def get_hovered_key(self, finger_pos) -> "Key | None":
-        """
-        Find and return the key the finger is currently over.
-
-        ALGORITHM: Linear search (O(n), n ≈ 28 keys)
-        -----------------------------------------------
-        We loop through every key and call key.contains(finger_pos).
-        First match wins (keys don't overlap so there's at most one hit).
-
-        WHY NOT A SPATIAL DATA STRUCTURE?
-        -----------------------------------
-        For 28 keys, linear search is perfectly fast — O(28) = constant time
-        in practice. A spatial structure (like a quadtree or grid hash) would
-        add complexity for zero measurable benefit at this scale.
-        Rule: don't over-engineer. Optimize when profiling proves it's needed.
-
-        Parameters
-        ----------
-        finger_pos : (int, int) | None
-            Pixel position of index finger tip. None = no hand detected.
-
-        Returns
-        -------
-        Key | None
-            The hovered Key, or None if no key is under the finger.
-        """
+        """Linear search: which key contains the finger position? O(28)."""
         if finger_pos is None:
             self.hovered_key = None
             return None
-
         for key in self.keys:
             if key.contains(finger_pos):
                 self.hovered_key = key
                 return key
-
         self.hovered_key = None
+        return None
+
+    def get_hovered_suggestion(self, finger_pos) -> "SuggestionBox | None":
+        """
+        Check if the finger is over any suggestion box.
+
+        WHY CHECK SUGGESTIONS SEPARATELY FROM KEYS?
+        ---------------------------------------------
+        Suggestion boxes sit in a different region of the frame (above the keyboard).
+        We check them BEFORE keys so a pinch on a suggestion doesn't also fire
+        a key below it. The caller (main.py) uses the result to decide which
+        action to take.
+        """
+        if finger_pos is None:
+            self.hovered_suggestion = None
+            return None
+        for box in self.suggestion_boxes:
+            if box.contains(finger_pos):
+                self.hovered_suggestion = box
+                return box
+        self.hovered_suggestion = None
         return None
 
     def register_click(self):
         """
-        Register a keypress on the currently hovered key.
+        Type the currently hovered key into typed_text.
 
-        Called by main.py when a pinch gesture fires AND a key is hovered.
-        The Keyboard does NOT detect pinches — it just responds to them.
-
-        TYPED TEXT LOGIC
-        ----------------
-        'SPC'  → append a space character
-        'BACK' → remove the last character (Python string slicing: s[:-1])
-        other  → append the letter
-
-        WHY s[:-1] FOR BACKSPACE?
-        --------------------------
-        In Python, s[:-1] means "everything except the last character".
-        It's equivalent to s[:len(s)-1] but more idiomatic.
-        It handles the empty string safely ('' [:-1] = '' — no crash).
+        TYPED TEXT RULES
+        -----------------
+        'SPC'  → append space
+        'BACK' → remove last character (s[:-1])
+        other  → append letter
         """
         if self.hovered_key is None:
             return
-
         label = self.hovered_key.label
-
         if label == "SPC":
             self.typed_text += " "
         elif label == "BACK":
@@ -311,59 +353,100 @@ class Keyboard:
         else:
             self.typed_text += label
 
+    def select_suggestion(self):
+        """
+        Auto-complete typed_text with the currently hovered suggestion word.
+
+        ALGORITHM: Replace Partial Word
+        --------------------------------
+        typed_text = "HAPP"
+        suggestion = "HAPPY"
+
+        1. Split typed_text by space: ["HAPP"]
+        2. Drop the last element (the partial word): []
+        3. Rejoin with spaces: ""
+        4. Append suggestion + space: "HAPPY "
+
+        typed_text = "HELLO WOR"
+        suggestion = "WORLD"
+
+        1. Split: ["HELLO", "WOR"]
+        2. Drop last: ["HELLO"]
+        3. Rejoin: "HELLO"
+        4. Append: "HELLO WORLD "   ← note the trailing space (next word starts)
+
+        WHY A TRAILING SPACE?
+        ----------------------
+        After auto-completing "WORLD", the user is starting the NEXT word.
+        The space triggers next-word prediction in the predictor.
+        This matches behavior of every phone keyboard.
+        """
+        if self.hovered_suggestion is None or not self.hovered_suggestion.word:
+            return
+
+        words = self.typed_text.split(" ")
+        words = words[:-1]                    # drop the partial word
+        words.append(self.hovered_suggestion.word)
+        self.typed_text = " ".join(words) + " "   # rejoin + trailing space
+
+    # ── Drawing ───────────────────────────────────────────────────────────────
+
     def draw(self, frame, finger_pos=None):
         """
-        Draw the entire keyboard and the typed text display onto the frame.
+        Render the full keyboard UI: suggestions → text display → keys.
 
-        CHANGE FROM SPRINT 1
-        ---------------------
-        In Sprint 1, draw() drew all keys identically.
-        Now it accepts finger_pos and passes the hover state to each key.
-        The Keyboard decides which key is hovered; each Key decides how to draw itself.
-        Responsibility is cleanly separated.
+        DRAWING ORDER MATTERS
+        ----------------------
+        We draw in this order:
+            1. Suggestion bar (topmost visual element)
+            2. Text display bar
+            3. Keyboard keys (bottommost)
 
-        Parameters
-        ----------
-        frame      : np.ndarray       BGR frame to draw on.
-        finger_pos : (int, int) | None   Index finger tip pixel position.
+        Painter's algorithm: bottom layers first if they overlap.
+        Here they don't overlap but we still draw top-to-bottom for clarity.
         """
-        # Determine which key (if any) is hovered this frame
-        hovered = self.get_hovered_key(finger_pos)
+        hov_sug = self.get_hovered_suggestion(finger_pos)
+        hov_key = self.get_hovered_key(finger_pos)
 
-        # Draw all keys, passing hovered=True only to the hovered key
-        for key in self.keys:
-            key.draw(frame, hovered=(key is hovered))
-
-        # Draw the typed text display above the keyboard
+        self._draw_suggestion_bar(frame, hov_sug)
         self._draw_text_display(frame)
+
+        for key in self.keys:
+            key.draw(frame, hovered=(key is hov_key))
+
+    def _draw_suggestion_bar(self, frame, hovered_box):
+        """Render the 3 suggestion boxes side by side."""
+        for box in self.suggestion_boxes:
+            box.draw(frame, hovered=(box is hovered_box))
 
     def _draw_text_display(self, frame):
         """
-        Draw the typed text string in a box above the keyboard.
+        Render the typed text in a dark bar between suggestions and keyboard.
 
-        DISPLAY LOGIC
-        -------------
-        - Show last 30 characters to prevent overflow (sliding window)
-        - Show a blinking cursor (we simulate this with a static '|' for now)
-        - Background box behind text for readability over webcam feed
+        SLIDING WINDOW (last 40 chars)
+        --------------------------------
+        If typed_text is very long, only show the last 40 characters.
+        This prevents text overflowing outside the bar.
+        This is a sliding window: as you type, the window shifts right.
         """
-        display_text = self.typed_text[-30:] + "|"   # sliding window + cursor
+        display_text = self.typed_text[-40:] + "|"
 
-        # Draw a dark semi-transparent background bar
-        bar_y1 = START_Y - 60
-        bar_y2 = START_Y - 10
-        cv2.rectangle(frame, (START_X, bar_y1), (START_X + KEYBOARD_CANVAS_WIDTH, bar_y2),
-                      (20, 20, 20), -1)
-        cv2.rectangle(frame, (START_X, bar_y1), (START_X + KEYBOARD_CANVAS_WIDTH, bar_y2),
-                      (80, 80, 80), 1)
+        # Dark background bar
+        cv2.rectangle(frame,
+                      (START_X, TEXT_BAR_Y1),
+                      (START_X + KEYBOARD_CANVAS_WIDTH, TEXT_BAR_Y2),
+                      (15, 15, 15), -1)
+        cv2.rectangle(frame,
+                      (START_X, TEXT_BAR_Y1),
+                      (START_X + KEYBOARD_CANVAS_WIDTH, TEXT_BAR_Y2),
+                      (70, 70, 70), 1)
 
-        # Draw the text inside the bar
         cv2.putText(
             frame,
             display_text,
-            (START_X + 10, bar_y2 - 12),
+            (START_X + 12, TEXT_BAR_Y2 - 12),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
+            0.75,
             COLOR_TYPED_TEXT,
             2,
         )
