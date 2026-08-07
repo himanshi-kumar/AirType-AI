@@ -18,11 +18,27 @@ while True:
     if not ret:
         print("Error: Could not read frame.")
         break
-
+    cv2.circle(frame,(320, 240), 40,(0, 255, 0),1)
+    cv2.rectangle(
+    frame,
+    (100,100), #top left 
+    (300,200), #bottom right
+    (255,0,0), #blue in BGR
+    3 #thickness
+)
+    cv2.putText(
+    frame,
+    "A",
+    (125,150),
+    cv2.FONT_HERSHEY_SIMPLEX,
+    1,
+    (255,255,255),
+    2
+)
 
     # Display the frame
     cv2.imshow("AirType AI", frame)
-
+    
     # Press 'q' to quit
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
