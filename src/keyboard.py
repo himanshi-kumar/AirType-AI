@@ -1,25 +1,29 @@
 """
-keyboard.py — Sprint 4: Virtual Keyboard with Hover, Typing, and Word Suggestions
+keyboard.py — Sprint 8: Premium UI Polish
 
-WHAT'S NEW IN SPRINT 4
+WHAT'S NEW IN SPRINT 8
 -----------------------
-Sprint 3: Hover detection, green highlight, pinch-to-type, text display
-Sprint 4: Suggestion bar — 3 predicted word buttons above the text display
-          select_suggestion() — auto-complete + replace partial word
-          Layout upgraded to 1280×720 (larger, cleaner)
+Sprint 6: SPEAK key (purple) triggers Text-to-Speech
+Sprint 7: Sound feedback for every key event
+Sprint 8: + Glassmorphism key fill (cv2.addWeighted translucent overlay)
+          + SPEAK pulse animation (orange ring while TTS is active)
+          + Stats bar (word count + WPM displayed above suggestions)
 
 LAYOUT (1280 × 720 frame)
 --------------------------
 y=0-360:    Webcam feed (hand tracking)
+y=330-362:  Stats bar  (word count | WPM)
 y=365-405:  Suggestion bar  (3 word prediction boxes)
 y=410-450:  Typed text display
 y=455-505:  QWERTY row
 y=512-562:  ASDFG row
 y=569-619:  ZXCVB row
-y=626-676:  SPACE / BACK row
+y=626-676:  SPACE / SPEAK / BACK row
 """
 
 import cv2
+import math
+import time
 
 
 # ── Layout constants (calibrated for 1280×720) ────────────────────────────────
@@ -56,6 +60,22 @@ COLOR_SUGGESTION_HV   = (60,  60, 180)    # lighter blue when hovered
 COLOR_SUGGESTION_TEXT = (200, 220, 255)   # light blue text
 COLOR_SUGGESTION_HV_T = (255, 255, 255)   # white text when hovered
 
+# SPEAK key colors (purple to visually distinguish from typing keys)
+COLOR_SPEAK_NORMAL    = (100, 40,  80)    # dark purple
+COLOR_SPEAK_HOVER     = (180, 80, 160)    # bright purple when hovered
+COLOR_SPEAK_BORDER    = (160, 100, 180)   # purple border
+
+# Sprint 8 — glassmorphism overlay alpha and pulse colors
+GLASS_ALPHA      = 0.55       # key fill opacity (0.0 = transparent, 1.0 = opaque)
+COLOR_PULSE      = (0, 165, 255)   # orange in BGR — SPEAK pulse ring color
+COLOR_STATS_BG   = (10,  10,  20)  # near-black stats bar background
+COLOR_STATS_TEXT = (160, 220, 255) # light-blue stats text
+
+# Stats bar geometry
+STATS_BAR_Y1 = 330
+STATS_BAR_Y2 = 362
+
+
 
 class Key:
     """
@@ -86,32 +106,61 @@ class Key:
         """
         Draw this key using the painter's algorithm: fill → border → text.
 
-        PAINTER'S ALGORITHM
+        GLASSMORPHISM (Sprint 8)
+        ------------------------
+        Instead of a solid filled rectangle, we composite a semi-transparent
+        colored layer over the existing frame pixels using cv2.addWeighted().
+
+        FORMULA
+        --------
+        dst = src1 * alpha + src2 * (1 - alpha) + gamma
+
+        Where:
+          src1  = colored fill rectangle (solid color)
+          src2  = the existing frame pixels behind the key
+          alpha = GLASS_ALPHA (0.55 = 55% fill, 45% see-through)
+          gamma = 0 (no brightness offset)
+
+        Result: key fill is semi-transparent, showing the webcam feed behind it.
+        This creates a "frosted glass" depth effect.
+
+        WHY cv2.addWeighted?
         --------------------
-        Named after physical oil painting: distant objects first, foreground last.
-        Here:  background fill → border → letter label
-        Each layer overwrites pixels beneath it.
-
-        TEXT CENTERING MATH
-        --------------------
-        cv2.getTextSize() returns the bounding box of the text string.
-        We use it to compute the pixel offset that centers text inside the key:
-
-            text_x = key.x + (key.width  - text_width)  // 2
-            text_y = key.y + (key.height + text_height) // 2
-
-        Note: cv2 y-coordinates measure from TOP, but putText baseline
-        is at the BOTTOM of the characters. That's why we ADD text_height
-        for y but SUBTRACT text_width for x — they measure different things.
+        It's a single optimized C++ call that blends two same-size NumPy arrays.
+        Equivalent to: frame[roi] = fill * alpha + frame[roi] * (1 - alpha)
+        but faster due to SIMD vectorization in OpenCV's native layer.
         """
-        fill   = COLOR_KEY_HOVER   if hovered else COLOR_KEY_NORMAL
-        border = COLOR_KEY_BORDER_HV if hovered else COLOR_KEY_BORDER
-        tl     = (self.x,              self.y)
-        br     = (self.x + self.width, self.y + self.height)
+        # SPEAK key uses distinct purple colors
+        if self.label == "SPEAK":
+            fill   = COLOR_SPEAK_HOVER  if hovered else COLOR_SPEAK_NORMAL
+            border = COLOR_SPEAK_BORDER
+        else:
+            fill   = COLOR_KEY_HOVER   if hovered else COLOR_KEY_NORMAL
+            border = COLOR_KEY_BORDER_HV if hovered else COLOR_KEY_BORDER
 
-        cv2.rectangle(frame, tl, br, fill,   -1)    # fill
-        cv2.rectangle(frame, tl, br, border,  2)    # border
+        tl = (self.x,              self.y)
+        br = (self.x + self.width, self.y + self.height)
 
+        # ── Glassmorphism fill (Sprint 8) ─────────────────────────────────
+        # Extract the key's region of interest (ROI) from the current frame
+        roi = frame[self.y : self.y + self.height, self.x : self.x + self.width]
+        if roi.size > 0:
+            import numpy as np
+            # Create a solid-color overlay the same size as the ROI
+            overlay = np.full_like(roi, fill[::-1] if len(fill) == 3 else fill)
+            # Wait — fill is already BGR; np.full_like fills all channels equally.
+            # We need to fill each channel separately:
+            overlay[:, :, 0] = fill[0]   # Blue channel
+            overlay[:, :, 1] = fill[1]   # Green channel
+            overlay[:, :, 2] = fill[2]   # Red channel
+            # Blend: GLASS_ALPHA * overlay + (1 - GLASS_ALPHA) * frame_roi
+            blended = cv2.addWeighted(overlay, GLASS_ALPHA, roi, 1 - GLASS_ALPHA, 0)
+            frame[self.y : self.y + self.height, self.x : self.x + self.width] = blended
+
+        # Border (always fully opaque)
+        cv2.rectangle(frame, tl, br, border, 2)
+
+        # Centered text label
         font, fscale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2
         color = COLOR_TEXT_HOVER if hovered else COLOR_TEXT_NORMAL
         (tw, th), _ = cv2.getTextSize(self.label, font, fscale, thick)
@@ -248,12 +297,19 @@ class Keyboard:
                 self.keys.append(Key(letter, x, y, KEY_WIDTH, KEY_HEIGHT))
                 x += KEY_WIDTH + GAP
 
-        # Special keys (SPACE and BACK)
+        # Special keys (SPACE, SPEAK, and BACK)
         sp_y = START_Y + 3 * (KEY_HEIGHT + GAP)
-        sp_w = KEY_WIDTH * 5 + GAP * 4
-        sp_x = START_X + (KEYBOARD_CANVAS_WIDTH - sp_w) // 2
-        self.keys.append(Key("SPC",  sp_x,              sp_y, sp_w,          KEY_HEIGHT))
-        self.keys.append(Key("BACK", sp_x + sp_w + GAP*2, sp_y, KEY_WIDTH*2, KEY_HEIGHT))
+        # Layout: [   SPC   ] [SPEAK] [ BACK ]
+        # SPC is wide (5 keys), SPEAK and BACK are 2 keys each.
+        spc_w   = KEY_WIDTH * 4 + GAP * 3                  # space bar width
+        speak_w = KEY_WIDTH * 2 + GAP                       # SPEAK key width
+        back_w  = KEY_WIDTH * 2 + GAP                       # BACK key width
+        total_w = spc_w + GAP * 2 + speak_w + GAP * 2 + back_w
+        sp_x    = START_X + (KEYBOARD_CANVAS_WIDTH - total_w) // 2
+
+        self.keys.append(Key("SPC",   sp_x,                                sp_y, spc_w,   KEY_HEIGHT))
+        self.keys.append(Key("SPEAK", sp_x + spc_w + GAP * 2,             sp_y, speak_w, KEY_HEIGHT))
+        self.keys.append(Key("BACK",  sp_x + spc_w + GAP * 2 + speak_w + GAP * 2, sp_y, back_w,  KEY_HEIGHT))
 
     def _create_suggestion_bar(self, n: int = 3):
         """
@@ -333,25 +389,49 @@ class Keyboard:
         self.hovered_suggestion = None
         return None
 
-    def register_click(self):
+    def register_click(self, predictor=None):
         """
         Type the currently hovered key into typed_text.
 
         TYPED TEXT RULES
         -----------------
-        'SPC'  → append space
+        'SPC'  → append space (+ auto-correct the last word if misspelled)
         'BACK' → remove last character (s[:-1])
         other  → append letter
+
+        AUTO-CORRECT ON SPACE (Sprint 5)
+        ----------------------------------
+        When the user presses SPACE, we check if the last word is misspelled.
+        If it is, we replace it with the closest vocabulary match BEFORE
+        appending the space. This matches phone keyboard behavior:
+            User types:  "THW" + SPACE
+            Result:      "THE "
+
+        Parameters
+        ----------
+        predictor : WordPredictor | None
+            The prediction engine. If provided and the last word is misspelled,
+            the word is auto-corrected before the space is appended.
         """
         if self.hovered_key is None:
             return
         label = self.hovered_key.label
         if label == "SPC":
+            # ── Auto-correct before appending space ───────────────────────
+            if predictor is not None and self.typed_text:
+                words = self.typed_text.split(" ")
+                last_word = words[-1]
+                if last_word:  # not empty (avoid double-space edge case)
+                    correction = predictor.get_autocorrect(last_word)
+                    if correction is not None:
+                        words[-1] = correction
+                        self.typed_text = " ".join(words)
             self.typed_text += " "
         elif label == "BACK":
             self.typed_text = self.typed_text[:-1]
         else:
             self.typed_text += label
+
 
     def select_suggestion(self):
         """
@@ -391,33 +471,125 @@ class Keyboard:
 
     # ── Drawing ───────────────────────────────────────────────────────────────
 
-    def draw(self, frame, finger_pos=None):
+    def draw(self, frame, finger_pos=None, is_speaking: bool = False,
+              session_start: float = None):
         """
-        Render the full keyboard UI: suggestions → text display → keys.
+        Render the full keyboard UI: stats → suggestions → text display → keys.
 
         DRAWING ORDER MATTERS
         ----------------------
-        We draw in this order:
-            1. Suggestion bar (topmost visual element)
-            2. Text display bar
-            3. Keyboard keys (bottommost)
+        1. Stats bar       (topmost visual element, Sprint 8)
+        2. Suggestion bar
+        3. Text display bar
+        4. Keyboard keys
+        5. SPEAK pulse ring (topmost overlay, drawn last, Sprint 8)
 
-        Painter's algorithm: bottom layers first if they overlap.
-        Here they don't overlap but we still draw top-to-bottom for clarity.
+        Parameters
+        ----------
+        frame        : np.ndarray   Current video frame
+        finger_pos   : tuple|None   Index finger tip pixel position
+        is_speaking  : bool         True if TTS is currently active (Sprint 8)
+        session_start: float|None   time.time() when typing began, for WPM (Sprint 8)
         """
         hov_sug = self.get_hovered_suggestion(finger_pos)
         hov_key = self.get_hovered_key(finger_pos)
 
+        self._draw_stats_bar(frame, session_start)
         self._draw_suggestion_bar(frame, hov_sug)
         self._draw_text_display(frame)
 
         for key in self.keys:
             key.draw(frame, hovered=(key is hov_key))
 
+        if is_speaking:
+            self._draw_speak_pulse(frame)
+
     def _draw_suggestion_bar(self, frame, hovered_box):
         """Render the 3 suggestion boxes side by side."""
         for box in self.suggestion_boxes:
             box.draw(frame, hovered=(box is hovered_box))
+
+    def _draw_stats_bar(self, frame, session_start: float = None):
+        """
+        Draw a slim stats bar showing word count and WPM.
+
+        WORD COUNT
+        ----------
+        Count words by splitting on spaces and filtering empty strings.
+        "HELLO WORLD " → ["HELLO", "WORLD"] → 2 words.
+
+        WPM (Words Per Minute)
+        ----------------------
+        WPM = (words_typed / elapsed_minutes)
+        Where elapsed_minutes = (now - session_start) / 60.
+        Standard typing test measurement.
+
+        We only show WPM after 10 seconds (avoids wild early spikes).
+        """
+        # Background
+        cv2.rectangle(
+            frame,
+            (START_X, STATS_BAR_Y1),
+            (START_X + KEYBOARD_CANVAS_WIDTH, STATS_BAR_Y2),
+            COLOR_STATS_BG, -1
+        )
+        cv2.rectangle(
+            frame,
+            (START_X, STATS_BAR_Y1),
+            (START_X + KEYBOARD_CANVAS_WIDTH, STATS_BAR_Y2),
+            (40, 40, 60), 1
+        )
+
+        # Word count
+        words = [w for w in self.typed_text.split(" ") if w]
+        word_count = len(words)
+
+        # WPM
+        wpm_str = ""
+        if session_start is not None:
+            elapsed = time.time() - session_start
+            if elapsed >= 10 and word_count > 0:
+                wpm = int(word_count / (elapsed / 60))
+                wpm_str = f"  |  {wpm} WPM"
+
+        stats_text = f"Words: {word_count}{wpm_str}"
+
+        cv2.putText(
+            frame,
+            stats_text,
+            (START_X + 12, STATS_BAR_Y2 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            COLOR_STATS_TEXT,
+            1,
+        )
+
+    def _draw_speak_pulse(self, frame):
+        """
+        Draw a pulsing orange ring around the SPEAK key while TTS is active.
+
+        PULSE ANIMATION
+        ---------------
+        The ring radius oscillates using a sine wave driven by real time:
+            radius = base_radius + amplitude * sin(2π * freq * t)
+
+        This creates a smooth, continuous breathing/pulse effect at ~2Hz.
+        The ring thickness also oscillates (2→3px) for extra visual weight.
+        """
+        speak_key = next((k for k in self.keys if k.label == "SPEAK"), None)
+        if speak_key is None:
+            return
+
+        cx = speak_key.x + speak_key.width  // 2
+        cy = speak_key.y + speak_key.height // 2
+        base_r = max(speak_key.width, speak_key.height) // 2 + 6
+
+        t = time.time()
+        pulse     = math.sin(2 * math.pi * 2.0 * t)   # 2Hz pulse
+        radius    = int(base_r + 6 * pulse)
+        thickness = 2 if pulse > 0 else 3
+
+        cv2.circle(frame, (cx, cy), radius, COLOR_PULSE, thickness)
 
     def _draw_text_display(self, frame):
         """

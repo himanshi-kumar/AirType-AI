@@ -1,5 +1,107 @@
 # Changelog
 
+## v0.8.0
+
+### Sprint 8 – Premium UI Polish (Glassmorphism, Live Stats & Speaking Pulse)
+
+### Added
+
+- **Glassmorphism Keys**: Keys rendered with semi-transparent alpha blending (`cv2.addWeighted`) for a modern frosted-glass HUD aesthetic.
+- **Live Typing Stats Bar**: Displays current word count and live WPM (Words Per Minute) above the suggestion bar.
+- **Visual SPEAK Pulse**: Smooth 2Hz sine-animated orange pulse ring around the `SPEAK` key during active TTS speech.
+- `tests/test_ui.py` — 9 unit tests covering glassmorphism ROI blending, stats calculations, and pulse rendering.
+- `docs/engineering-journal/Day-09.md` — UI compositing and parametric animation principles.
+
+### Learning Outcomes
+
+- OpenCV ROI alpha compositing with `cv2.addWeighted`
+- Time-based parametric visual animations in 30fps game loops
+- Real-time typing speed and telemetry calculation
+
+---
+
+## v0.7.0
+
+### Sprint 7 – Sound Feedback (Synthesized Audio via NumPy + sounddevice)
+
+### Added
+
+- `src/audio.py` — `SoundPlayer` class with 5 synthesized audio cues (no audio files)
+- 5 distinct sounds mapped to 5 distinct keyboard events:
+  - Letter key → 440Hz sine click (50ms)
+  - `SPC` → 220Hz sine thud (80ms)
+  - `BACK` → 330→165Hz descending sweep (70ms)
+  - Suggestion selected → 523→784Hz rising sweep (120ms)
+  - `SPEAK` activated → 440+550Hz chord (150ms)
+- Fade-out envelope on all sounds to eliminate end-click artifacts
+- `tests/test_audio.py` — 18 unit tests (synthesis length, amplitude, dtype, fade, playback)
+- `docs/engineering-journal/Day-08.md` — audio fundamentals and design decisions
+
+### Learning Outcomes
+
+- Digital audio sample representation (44,100 Hz, float32 in `[-1.0, 1.0]`)
+- Sine wave synthesis from NumPy (`sin(2πft)`)
+- Frequency sweep (chirp) synthesis via phase integration
+- Chord synthesis via superposition + normalization
+- Fade-out envelope to prevent speaker pop artifacts
+- Pre-computation pattern for real-time audio in a 30fps loop
+
+---
+
+## v0.6.0
+
+### Sprint 6 – Voice Output (Offline Text-to-Speech via pyttsx3)
+
+### Added
+
+- `src/speech.py` — `Speaker` class with non-blocking background daemon thread and mutex locking
+- `SPEAK` key on bottom row of virtual keyboard (centered between `SPC` and `BACK`)
+- Distinct purple styling for `SPEAK` key (`COLOR_SPEAK_NORMAL`, `COLOR_SPEAK_HOVER`, `COLOR_SPEAK_BORDER`)
+- Priority event dispatching in `main.py` routing pinches on `SPEAK` to `Speaker.speak()`
+- `tests/test_speech.py` — 13 unit tests verifying initialization, non-blocking execution, stopping, and layout
+- `docs/engineering-journal/Day-07.md` — Sprint 6 architectural design and concurrency notes
+- `pyttsx3==2.99` dependency added to `requirements.txt`
+
+### Learning Outcomes
+
+- Operating system native speech engines (`NSSpeechSynthesizer`, SAPI5, eSpeak)
+- Daemon threads for background task execution without blocking OpenCV 30fps stream
+- Mutual exclusion locks (`threading.Lock`) for thread-unsafe C-extension APIs
+
+---
+
+## v0.5.0
+
+### Sprint 5 – Spelling Auto-Correct (Damerau-Levenshtein + QWERTY Weights)
+
+### Added
+
+- `KEY_CENTERS` — QWERTY key center pixel coordinates for distance weighting
+- `get_substitution_cost()` — Euclidean distance-based substitution cost between keys
+- `damerau_levenshtein_distance()` — QWERTY-weighted edit distance with transposition support
+- `WordPredictor.get_autocorrect()` — finds closest vocabulary match for misspelled words
+- Fuzzy backoff in `_predict_completions()` — fills suggestion slots with DL matches when prefix matches are insufficient
+- Auto-correct on SPACE press — `register_click(predictor)` corrects the last word before appending space
+- `tests/test_spelling.py` — 30 unit tests covering all new functionality
+- `docs/engineering-journal/Day-06.md` — Sprint 5 design decisions and concepts
+
+### Architecture
+
+- `prediction.py` owns all spelling correction logic (Single Responsibility)
+- `keyboard.py` calls predictor on SPC press (dependency injection, not import)
+- `main.py` passes predictor into keyboard click handler (wiring, no logic)
+- First-letter mismatch penalty (+1.5) prevents unrelated short words from polluting corrections
+
+### Learning Outcomes
+
+- Levenshtein distance (edit distance DP algorithm)
+- Damerau-Levenshtein extension (transposition = 80% of human typos)
+- QWERTY-weighted substitution cost (physical keyboard distance)
+- Fuzzy string matching backoff (prefix → edit distance)
+- Threshold scaling (longer words → more tolerance for typos)
+
+---
+
 ## v0.4.0
 
 ### Sprint 3 – Finger Tracking, Hover Detection, Pinch-to-Click Typing

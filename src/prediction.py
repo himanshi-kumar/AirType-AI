@@ -62,6 +62,182 @@ The rest of the system won't need to change — that's good interface design.
 """
 
 
+# ── QWERTY Key Center Coordinates (pixel positions) ──────────────────────────
+# Derived from keyboard.py layout constants:
+#   START_X = 50, START_Y = 455, KEY_WIDTH = 58, KEY_HEIGHT = 50, GAP = 8
+#   KEYBOARD_CANVAS_WIDTH = 1180
+#
+# Each value is the (center_x, center_y) of the key in the 1280×720 frame.
+# Row centering formula:
+#   row_pixel_width = n_keys × (KEY_WIDTH + GAP) - GAP
+#   row_start_x     = START_X + (KEYBOARD_CANVAS_WIDTH - row_pixel_width) // 2
+#   center_x        = row_start_x + key_index × (KEY_WIDTH + GAP) + KEY_WIDTH // 2
+#   center_y        = START_Y + row_index × (KEY_HEIGHT + GAP) + KEY_HEIGHT // 2
+#
+# WHY STORE PIXEL COORDINATES?
+# We use Euclidean distance between key centers to weight substitution cost.
+# Adjacent keys (W/E) have small pixel distance → low substitution cost.
+# Distant keys (Q/M) have large pixel distance → high substitution cost.
+# This makes the auto-corrector QWERTY-aware: it knows that typing 'W'
+# instead of 'E' is a more likely typo than typing 'W' instead of 'M'.
+
+KEY_CENTERS: dict = {
+    # Row 0: QWERTYUIOP (10 keys, row_start_x = 314)
+    "Q": (343, 480), "W": (409, 480), "E": (475, 480), "R": (541, 480),
+    "T": (607, 480), "Y": (673, 480), "U": (739, 480), "I": (805, 480),
+    "O": (871, 480), "P": (937, 480),
+    # Row 1: ASDFGHJKL (9 keys, row_start_x = 347)
+    "A": (376, 538), "S": (442, 538), "D": (508, 538), "F": (574, 538),
+    "G": (640, 538), "H": (706, 538), "J": (772, 538), "K": (838, 538),
+    "L": (904, 538),
+    # Row 2: ZXCVBNM (7 keys, row_start_x = 413)
+    "Z": (442, 596), "X": (508, 596), "C": (574, 596), "V": (640, 596),
+    "B": (706, 596), "N": (772, 596), "M": (838, 596),
+}
+
+
+def get_substitution_cost(char1: str, char2: str) -> float:
+    """
+    Compute the cost of substituting char1 with char2.
+
+    QWERTY-AWARE SUBSTITUTION
+    --------------------------
+    Standard Levenshtein treats all substitutions equally (cost = 1).
+    But on a QWERTY keyboard, mistyping 'W' for 'E' (adjacent keys) is
+    far more likely than mistyping 'W' for 'M' (opposite side of keyboard).
+
+    We use the Euclidean distance between key centers to scale the cost:
+        cost = 0.2 + 0.8 × min(2.0, pixel_distance / 90.0)
+
+    - Adjacent keys (W↔E): ~66px apart → cost ≈ 0.79
+    - Diagonal neighbors (Q↔S): ~110px → cost ≈ 1.18
+    - Far-apart keys (Q↔M): ~500px → cost = 1.80 (capped)
+
+    The formula:
+    - 0.2 = minimum cost (even adjacent keys aren't free substitutions)
+    - 0.8 × ... = scales from 0.0 to 1.6 based on distance
+    - 90.0 = normalization constant (approximately one key-width + gap)
+    - cap at 2.0 prevents extremely distant keys from dominating the score
+
+    Parameters
+    ----------
+    char1 : str   Character in the input word.
+    char2 : str   Character in the vocabulary word.
+
+    Returns
+    -------
+    float   Substitution cost: 0.0 if identical, 0.2–1.8 based on key distance,
+            1.0 if either character is not on the QWERTY layout.
+    """
+    if char1 == char2:
+        return 0.0
+    if char1 not in KEY_CENTERS or char2 not in KEY_CENTERS:
+        return 1.0
+
+    x1, y1 = KEY_CENTERS[char1]
+    x2, y2 = KEY_CENTERS[char2]
+    pixel_dist = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+
+    return 0.2 + 0.8 * min(2.0, pixel_dist / 90.0)
+
+
+def damerau_levenshtein_distance(s1: str, s2: str) -> float:
+    """
+    Compute the QWERTY-weighted Damerau-Levenshtein distance between two strings.
+
+    WHAT IS DAMERAU-LEVENSHTEIN?
+    -----------------------------
+    Standard Levenshtein distance counts the minimum edits (insertions,
+    deletions, substitutions) to transform s1 into s2.
+
+    Damerau-Levenshtein adds a fourth operation: TRANSPOSITION — swapping
+    two adjacent characters. This is critical for keyboards because
+    transposition is one of the most common typing errors:
+        "HPAY" → "HAPY" → "HAPPY"
+
+    Without transposition support, "HPAP" → "HAPPY" costs 3 edits.
+    With transposition, it costs 2 (swap H↔P, then insert Y) — much closer
+    to the human's intended input.
+
+    QWERTY WEIGHTING
+    -----------------
+    Substitution costs are NOT uniform — they depend on the physical distance
+    between keys on the QWERTY layout (see get_substitution_cost).
+
+    FIRST-LETTER PENALTY
+    ----------------------
+    Users rarely mistype the first letter of a word. If the first letters
+    differ, we add a 1.5 penalty to the total distance. This prevents
+    short unrelated words from polluting the suggestions.
+    Example: "COMPUTW" should match "COMPUTER" (same first letter),
+             not "OUT" (different first letter, lower raw distance).
+
+    DP RECURRENCE
+    --------------
+    dp[i][j] = minimum cost to transform s1[0..i-1] into s2[0..j-1]
+
+    dp[i][j] = min(
+        dp[i-1][j]   + 1.0,                    # delete s1[i-1]
+        dp[i][j-1]   + 1.0,                    # insert s2[j-1]
+        dp[i-1][j-1] + sub_cost(s1[i-1], s2[j-1]),  # substitute
+        dp[i-2][j-2] + 1.0  (if s1[i-1]==s2[j-2] and s1[i-2]==s2[j-1])  # transpose
+    )
+
+    TIME COMPLEXITY: O(m × n) where m, n = lengths of s1, s2.
+    For our vocabulary of ~300 words with average length 5:
+        300 × 5 × 7 = ~10,500 operations per query. Instant at 30fps.
+
+    Parameters
+    ----------
+    s1 : str   Input word (what the user typed).
+    s2 : str   Candidate word from vocabulary.
+
+    Returns
+    -------
+    float   Weighted edit distance (lower = more similar).
+    """
+    m, n = len(s1), len(s2)
+
+    # Build DP table
+    dp = [[0.0] * (n + 1) for _ in range(m + 1)]
+
+    # Base cases: transforming empty string to/from a prefix
+    for i in range(m + 1):
+        dp[i][0] = float(i)
+    for j in range(n + 1):
+        dp[0][j] = float(j)
+
+    # Fill DP table
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            # Substitution cost: 0 if chars match, QWERTY-weighted otherwise
+            if s1[i - 1] == s2[j - 1]:
+                sub_cost = 0.0
+            else:
+                sub_cost = get_substitution_cost(s1[i - 1], s2[j - 1])
+
+            dp[i][j] = min(
+                dp[i - 1][j] + 1.0,            # deletion
+                dp[i][j - 1] + 1.0,            # insertion
+                dp[i - 1][j - 1] + sub_cost,   # substitution
+            )
+
+            # Transposition: swap two adjacent characters
+            # Only valid when both chars exist and form a swap pattern
+            if (i > 1 and j > 1
+                    and s1[i - 1] == s2[j - 2]
+                    and s1[i - 2] == s2[j - 1]):
+                dp[i][j] = min(dp[i][j], dp[i - 2][j - 2] + 1.0)
+
+    distance = dp[m][n]
+
+    # First-letter mismatch penalty
+    if m > 0 and n > 0 and s1[0] != s2[0]:
+        distance += 1.5
+
+    return distance
+
+
 # ── Vocabulary: Top 300 English words with relative frequency scores ──────────
 # Score = relative frequency (higher = more common).
 # Based on the Oxford English Corpus frequency list.
@@ -271,20 +447,22 @@ class WordPredictor:
     def _predict_completions(self, prefix: str, n: int) -> list:
         """
         Return top N words from vocabulary that START WITH the prefix.
+        Falls back to FUZZY MATCHING (Damerau-Levenshtein) if prefix yields < N.
 
-        ALGORITHM: Filter + Sort
-        ------------------------
+        ALGORITHM: Filter + Sort + Fuzzy Backoff
+        ------------------------------------------
         1. Filter: keep only words where word.startswith(prefix)
         2. Sort: by frequency score (descending — highest first)
         3. Slice: keep only the top N
+        4. NEW — If fewer than N prefix matches exist, fill remaining slots
+           with the closest Damerau-Levenshtein matches from the vocabulary.
+           This means typos like "THW" still produce useful suggestions ("THE").
 
         TIME COMPLEXITY
         ---------------
-        O(V log V) where V = vocabulary size.
-        For V=300: ~2,400 operations. At 30fps: 72,000 ops/sec. Instant.
-
-        A Trie (prefix tree) would reduce this to O(L) where L = prefix length,
-        but is unnecessary until vocabulary reaches 10,000+ words.
+        Prefix phase: O(V log V) where V = vocabulary size (~300 words).
+        Fuzzy phase:  O(V × m × k) where m = prefix length, k = avg word length.
+        Total: ~10,000 operations at worst. Still instant at 30fps.
 
         Parameters
         ----------
@@ -295,10 +473,11 @@ class WordPredictor:
         -------
         list[str]   Matching words sorted by frequency, up to n entries.
         """
-        # Don't suggest if prefix is just 1 char (too many matches, unhelpful)
+        # Don't suggest if prefix is empty
         if len(prefix) < 1:
             return []
 
+        # ── Phase 1: Exact prefix matches ─────────────────────────────────
         # Filter: keep only words that start with the prefix
         matches = [
             (word, score)
@@ -311,7 +490,35 @@ class WordPredictor:
         matches.sort(key=lambda item: item[1], reverse=True)
 
         # Return only the word labels (not the scores)
-        return [word for word, _ in matches[:n]]
+        suggestions = [word for word, _ in matches[:n]]
+
+        # ── Phase 2: Fuzzy backoff (Damerau-Levenshtein) ──────────────────
+        # If prefix matching didn't fill all N slots, find close matches.
+        # Example: user typed "THW" — no exact prefix match → fuzzy finds "THE".
+        if len(suggestions) < n:
+            # Maximum acceptable edit distance scales with input length.
+            # Short words (2-3 chars) allow small edits; longer words allow more.
+            max_allowed = max(1.5, len(prefix) * 0.8)
+
+            candidates = []
+            for word in self.vocabulary:
+                if word in suggestions:
+                    continue  # already in the list from prefix matching
+                dist = damerau_levenshtein_distance(prefix, word)
+                if dist <= max_allowed:
+                    candidates.append((word, dist, self.vocabulary[word]))
+
+            # Sort by (distance ASC, frequency DESC) — closest first,
+            # break ties by popularity.
+            candidates.sort(key=lambda x: (x[1], -x[2]))
+
+            for word, _, _ in candidates:
+                if word not in suggestions:
+                    suggestions.append(word)
+                    if len(suggestions) == n:
+                        break
+
+        return suggestions
 
     def _predict_next(self, last_word: str, n: int) -> list:
         """
@@ -358,3 +565,63 @@ class WordPredictor:
             reverse=True,
         )
         return [word for word, _ in sorted_words[:n]]
+
+    def get_autocorrect(self, word: str) -> str:
+        """
+        Return the best spelling correction for a misspelled word.
+
+        WHEN IS THIS CALLED?
+        ----------------------
+        When the user presses SPACE, the keyboard extracts the last word
+        and asks: "Is this word misspelled? If so, what should it be?"
+
+        ALGORITHM
+        ----------
+        1. If the word already exists in the vocabulary → return None (no fix needed).
+        2. Compute Damerau-Levenshtein distance to every vocabulary word.
+        3. Pick the word with the lowest distance.
+        4. If the best distance is within a threshold → return correction.
+        5. Otherwise → return None (word is too far from anything we know).
+
+        THRESHOLD FORMULA
+        ------------------
+        max_allowed = max(1.5, len(word) * 0.8)
+
+        - Short words ("HT", 2 chars): threshold = 1.6 → only very close matches
+        - Medium words ("HAPY", 4 chars): threshold = 3.2 → more tolerance
+        - Long words ("COMPUTW", 7 chars): threshold = 5.6 → even more tolerance
+
+        This scales linearly with word length because longer words naturally
+        accumulate more typos during air-typing.
+
+        Parameters
+        ----------
+        word : str   The word to check (uppercase).
+
+        Returns
+        -------
+        str | None   Corrected word if a close match exists, None otherwise.
+        """
+        if not word:
+            return None
+
+        # Already a valid word — no correction needed
+        if word in self.vocabulary:
+            return None
+
+        # Find the closest vocabulary word
+        best_word = None
+        min_dist = float("inf")
+
+        for vocab_word in self.vocabulary:
+            dist = damerau_levenshtein_distance(word, vocab_word)
+            if dist < min_dist:
+                min_dist = dist
+                best_word = vocab_word
+
+        # Only correct if the best match is close enough
+        max_allowed = max(1.5, len(word) * 0.8)
+        if min_dist <= max_allowed:
+            return best_word
+
+        return None
