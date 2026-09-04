@@ -2,7 +2,7 @@
 
 > An AI-powered touchless virtual keyboard — type in mid-air using hand gestures, auto-correct typos with spatial awareness, synthesize voice output, and receive real-time audio feedback.
 
-Built with **Python · OpenCV · MediaPipe · NumPy · pyttsx3 · sounddevice** by a 2nd-year CSE-AI student documenting every engineering decision from scratch.
+Built with **Python · OpenCV · MediaPipe · NumPy · pyttsx3 · sounddevice** by a 3rd-year CSE-AI student documenting every engineering decision from scratch.
 
 ---
 
