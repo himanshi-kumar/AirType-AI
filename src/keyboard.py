@@ -1,24 +1,30 @@
 """
-keyboard.py — Sprint 8: Premium UI Polish
+keyboard.py — Sprint 12: Number/Symbol Keypad Toggle & Visual Ripple Effect
 
-WHAT'S NEW IN SPRINT 8
+WHAT'S NEW IN SPRINT 12
 -----------------------
-Sprint 6: SPEAK key (purple) triggers Text-to-Speech
-Sprint 7: Sound feedback for every key event
-Sprint 8: + Glassmorphism key fill (cv2.addWeighted translucent overlay)
-          + SPEAK pulse animation (orange ring while TTS is active)
-          + Stats bar (word count + WPM displayed above suggestions)
+Sprint 6:  SPEAK key (purple) triggers Text-to-Speech
+Sprint 7:  Sound feedback for every key event
+Sprint 8:  + Glassmorphism key fill
+           + SPEAK pulse animation + Stats bar
+Sprint 11: + draw() accepts list of finger positions (multi-hand)
+           + get_hovered_keys() returns keys under ALL fingers
+           + FPS counter overlay
+Sprint 12: + RippleEffect expanding circle animation on keypress
+           + 123/ABC keypad mode toggle (numbers & symbols layout)
+           + CLR (clear) key to reset typed text buffer
+           + Custom styling for CLR and Mode switch keys
 
 LAYOUT (1280 × 720 frame)
 --------------------------
 y=0-360:    Webcam feed (hand tracking)
-y=330-362:  Stats bar  (word count | WPM)
+y=330-362:  Stats bar  (word count | WPM | FPS)
 y=365-405:  Suggestion bar  (3 word prediction boxes)
 y=410-450:  Typed text display
-y=455-505:  QWERTY row
-y=512-562:  ASDFG row
-y=569-619:  ZXCVB row
-y=626-676:  SPACE / SPEAK / BACK row
+y=455-505:  Row 0 (QWERTYUIOP or 1234567890)
+y=512-562:  Row 1 (ASDFGHJKL or @#$%&*()!?)
+y=569-619:  Row 2 (ZXCVBNM or .,:;'"-+==/)
+y=626-676:  Row 3 ([123/ABC] [SPC] [SPEAK] [BACK] [CLR])
 """
 
 import cv2
@@ -65,6 +71,21 @@ COLOR_SPEAK_NORMAL    = (100, 40,  80)    # dark purple
 COLOR_SPEAK_HOVER     = (180, 80, 160)    # bright purple when hovered
 COLOR_SPEAK_BORDER    = (160, 100, 180)   # purple border
 
+# CLR key colors (warm coral red)
+COLOR_CLR_NORMAL      = (30,  30, 110)
+COLOR_CLR_HOVER       = (50,  50, 200)
+COLOR_CLR_BORDER      = (70,  70, 160)
+COLOR_CLR_BORDER_HV   = (120, 120, 255)
+
+# 123/ABC mode switch key colors (slate cyan / amber)
+COLOR_MODE_NORMAL     = (80,  60,  20)
+COLOR_MODE_HOVER      = (180, 140, 30)
+COLOR_MODE_BORDER     = (120,  95, 30)
+COLOR_MODE_BORDER_HV  = (240, 200, 80)
+
+# Ripple effect default color (bright cyan/mint)
+COLOR_RIPPLE          = (0, 255, 200)
+
 # Sprint 8 — glassmorphism overlay alpha and pulse colors
 GLASS_ALPHA      = 0.55       # key fill opacity (0.0 = transparent, 1.0 = opaque)
 COLOR_PULSE      = (0, 165, 255)   # orange in BGR — SPEAK pulse ring color
@@ -74,6 +95,84 @@ COLOR_STATS_TEXT = (160, 220, 255) # light-blue stats text
 # Stats bar geometry
 STATS_BAR_Y1 = 330
 STATS_BAR_Y2 = 362
+
+
+class RippleEffect:
+    """
+    Expanding circle animation triggered on key press (Sprint 12).
+
+    Each ripple starts at the center of the pressed key and expands
+    outward over a short duration while fading in opacity.
+
+    FORMULA
+    --------
+    radius = max_radius * (elapsed / duration)
+    alpha  = max_alpha * (1.0 - (elapsed / duration))
+    """
+
+    def __init__(
+        self,
+        cx: int,
+        cy: int,
+        max_radius: int = 45,
+        duration: float = 0.30,
+        color: tuple = COLOR_RIPPLE,
+        max_alpha: float = 0.8,
+        thickness: int = 3,
+    ):
+        self.cx = cx
+        self.cy = cy
+        self.max_radius = max_radius
+        self.duration = duration
+        self.color = color  # BGR
+        self.max_alpha = max_alpha
+        self.thickness = thickness
+        self.start_time = time.time()
+
+    def is_finished(self, now: float = None) -> bool:
+        """Check whether the ripple animation duration has elapsed."""
+        if now is None:
+            now = time.time()
+        return (now - self.start_time) >= self.duration
+
+    def draw(self, frame, now: float = None):
+        """
+        Draw expanding ring with alpha fade onto the frame.
+        """
+        if now is None:
+            now = time.time()
+        elapsed = now - self.start_time
+        if elapsed < 0 or elapsed >= self.duration:
+            return
+
+        progress = elapsed / self.duration  # 0.0 -> 1.0
+        radius = int(self.max_radius * progress)
+        if radius <= 0:
+            return
+
+        alpha = self.max_alpha * (1.0 - progress)
+        if alpha <= 0.01:
+            return
+
+        pad = self.thickness + 2
+        x1 = max(0, self.cx - radius - pad)
+        y1 = max(0, self.cy - radius - pad)
+        x2 = min(frame.shape[1], self.cx + radius + pad + 1)
+        y2 = min(frame.shape[0], self.cy + radius + pad + 1)
+
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        roi = frame[y1:y2, x1:x2]
+        overlay = roi.copy()
+        cv2.circle(
+            overlay,
+            (self.cx - x1, self.cy - y1),
+            radius,
+            self.color,
+            self.thickness,
+        )
+        cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0, roi)
 
 
 
@@ -130,10 +229,16 @@ class Key:
         Equivalent to: frame[roi] = fill * alpha + frame[roi] * (1 - alpha)
         but faster due to SIMD vectorization in OpenCV's native layer.
         """
-        # SPEAK key uses distinct purple colors
+        # Key styling per type (Sprint 12)
         if self.label == "SPEAK":
             fill   = COLOR_SPEAK_HOVER  if hovered else COLOR_SPEAK_NORMAL
             border = COLOR_SPEAK_BORDER
+        elif self.label == "CLR":
+            fill   = COLOR_CLR_HOVER    if hovered else COLOR_CLR_NORMAL
+            border = COLOR_CLR_BORDER_HV if hovered else COLOR_CLR_BORDER
+        elif self.label in ("123", "ABC"):
+            fill   = COLOR_MODE_HOVER   if hovered else COLOR_MODE_NORMAL
+            border = COLOR_MODE_BORDER_HV if hovered else COLOR_MODE_BORDER
         else:
             fill   = COLOR_KEY_HOVER   if hovered else COLOR_KEY_NORMAL
             border = COLOR_KEY_BORDER_HV if hovered else COLOR_KEY_BORDER
@@ -160,10 +265,13 @@ class Key:
         # Border (always fully opaque)
         cv2.rectangle(frame, tl, br, border, 2)
 
-        # Centered text label
+        # Centered text label (adaptive scale to prevent overflow)
         font, fscale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2
-        color = COLOR_TEXT_HOVER if hovered else COLOR_TEXT_NORMAL
         (tw, th), _ = cv2.getTextSize(self.label, font, fscale, thick)
+        if tw > self.width - 8:
+            fscale = 0.65
+            (tw, th), _ = cv2.getTextSize(self.label, font, fscale, thick)
+        color = COLOR_TEXT_HOVER if hovered else COLOR_TEXT_NORMAL
         tx = self.x + (self.width  - tw) // 2
         ty = self.y + (self.height + th) // 2
         cv2.putText(frame, self.label, (tx, ty), font, fscale, color, thick)
@@ -269,6 +377,8 @@ class Keyboard:
         self.typed_text: str       = ""
         self.hovered_key           = None
         self.hovered_suggestion    = None
+        self.mode: str             = "ABC"   # "ABC" or "123" (Sprint 12)
+        self.ripples: list         = []      # active RippleEffect instances
         self._create_keyboard()
         self._create_suggestion_bar()
 
@@ -276,18 +386,29 @@ class Keyboard:
 
     def _create_keyboard(self):
         """
-        Programmatically generate all Key objects from the QWERTY row strings.
+        Programmatically generate all Key objects for the current mode.
 
         CENTERING ALGORITHM
         --------------------
         row_pixel_width = n_keys * (KEY_WIDTH + GAP) - GAP
         row_start_x     = START_X + (KEYBOARD_CANVAS_WIDTH - row_pixel_width) // 2
-
-        Example for QWERTYUIOP (10 keys):
-            row_width = 10 × (58+8) - 8 = 652
-            row_start_x = 50 + (1180 - 652) // 2 = 50 + 264 = 314
         """
-        rows = ["QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"]
+        self.keys.clear()
+
+        if self.mode == "123":
+            rows = [
+                ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
+                ["@", "#", "$", "%", "&", "*", "(", ")", "!", "?"],
+                [".", ",", ":", ";", "'", "\"", "-", "+", "=", "/"],
+            ]
+            toggle_label = "ABC"
+        else:
+            rows = [
+                list("QWERTYUIOP"),
+                list("ASDFGHJKL"),
+                list("ZXCVBNM"),
+            ]
+            toggle_label = "123"
 
         for row_idx, row in enumerate(rows):
             y = START_Y + row_idx * (KEY_HEIGHT + GAP)
@@ -297,19 +418,27 @@ class Keyboard:
                 self.keys.append(Key(letter, x, y, KEY_WIDTH, KEY_HEIGHT))
                 x += KEY_WIDTH + GAP
 
-        # Special keys (SPACE, SPEAK, and BACK)
+        # Row 3: Special keys [TOGGLE] [SPC] [SPEAK] [BACK] [CLR]
         sp_y = START_Y + 3 * (KEY_HEIGHT + GAP)
-        # Layout: [   SPC   ] [SPEAK] [ BACK ]
-        # SPC is wide (5 keys), SPEAK and BACK are 2 keys each.
-        spc_w   = KEY_WIDTH * 4 + GAP * 3                  # space bar width
-        speak_w = KEY_WIDTH * 2 + GAP                       # SPEAK key width
-        back_w  = KEY_WIDTH * 2 + GAP                       # BACK key width
-        total_w = spc_w + GAP * 2 + speak_w + GAP * 2 + back_w
-        sp_x    = START_X + (KEYBOARD_CANVAS_WIDTH - total_w) // 2
+        toggle_w = KEY_WIDTH + 14       # 72 px
+        spc_w    = KEY_WIDTH * 3 + GAP  # 182 px
+        speak_w  = KEY_WIDTH * 2 + GAP  # 124 px
+        back_w   = KEY_WIDTH * 2 + GAP  # 124 px
+        clr_w    = KEY_WIDTH + 14       # 72 px
 
-        self.keys.append(Key("SPC",   sp_x,                                sp_y, spc_w,   KEY_HEIGHT))
-        self.keys.append(Key("SPEAK", sp_x + spc_w + GAP * 2,             sp_y, speak_w, KEY_HEIGHT))
-        self.keys.append(Key("BACK",  sp_x + spc_w + GAP * 2 + speak_w + GAP * 2, sp_y, back_w,  KEY_HEIGHT))
+        total_w = toggle_w + GAP + spc_w + GAP + speak_w + GAP + back_w + GAP + clr_w
+        sp_x = START_X + (KEYBOARD_CANVAS_WIDTH - total_w) // 2
+
+        cur_x = sp_x
+        self.keys.append(Key(toggle_label, cur_x, sp_y, toggle_w, KEY_HEIGHT))
+        cur_x += toggle_w + GAP
+        self.keys.append(Key("SPC", cur_x, sp_y, spc_w, KEY_HEIGHT))
+        cur_x += spc_w + GAP
+        self.keys.append(Key("SPEAK", cur_x, sp_y, speak_w, KEY_HEIGHT))
+        cur_x += speak_w + GAP
+        self.keys.append(Key("BACK", cur_x, sp_y, back_w, KEY_HEIGHT))
+        cur_x += back_w + GAP
+        self.keys.append(Key("CLR", cur_x, sp_y, clr_w, KEY_HEIGHT))
 
     def _create_suggestion_bar(self, n: int = 3):
         """
@@ -389,33 +518,41 @@ class Keyboard:
         self.hovered_suggestion = None
         return None
 
+    def spawn_ripple(self, cx: int, cy: int, color: tuple = COLOR_RIPPLE):
+        """Spawn a new expanding ripple effect centered at (cx, cy)."""
+        self.ripples.append(RippleEffect(cx, cy, color=color))
+
+    def toggle_mode(self):
+        """Toggle between 'ABC' (letters) and '123' (numbers/symbols) modes."""
+        self.mode = "123" if self.mode == "ABC" else "ABC"
+        self._create_keyboard()
+
+    def clear_text(self):
+        """Clear all typed text in the text buffer."""
+        self.typed_text = ""
+
     def register_click(self, predictor=None):
         """
         Type the currently hovered key into typed_text.
 
         TYPED TEXT RULES
         -----------------
-        'SPC'  → append space (+ auto-correct the last word if misspelled)
-        'BACK' → remove last character (s[:-1])
-        other  → append letter
-
-        AUTO-CORRECT ON SPACE (Sprint 5)
-        ----------------------------------
-        When the user presses SPACE, we check if the last word is misspelled.
-        If it is, we replace it with the closest vocabulary match BEFORE
-        appending the space. This matches phone keyboard behavior:
-            User types:  "THW" + SPACE
-            Result:      "THE "
-
-        Parameters
-        ----------
-        predictor : WordPredictor | None
-            The prediction engine. If provided and the last word is misspelled,
-            the word is auto-corrected before the space is appended.
+        'SPC'      → append space (+ auto-correct the last word if misspelled)
+        'BACK'     → remove last character (s[:-1])
+        'CLR'      → clear all typed text
+        '123'/'ABC'→ toggle number/symbol layout mode
+        'SPEAK'    → handled externally by main loop
+        other      → append letter/symbol
         """
         if self.hovered_key is None:
             return
         label = self.hovered_key.label
+
+        # Sprint 12: Spawn ripple at clicked key center
+        cx = self.hovered_key.x + self.hovered_key.width // 2
+        cy = self.hovered_key.y + self.hovered_key.height // 2
+        self.spawn_ripple(cx, cy)
+
         if label == "SPC":
             # ── Auto-correct before appending space ───────────────────────
             if predictor is not None and self.typed_text:
@@ -429,40 +566,26 @@ class Keyboard:
             self.typed_text += " "
         elif label == "BACK":
             self.typed_text = self.typed_text[:-1]
+        elif label == "CLR":
+            self.clear_text()
+        elif label in ("123", "ABC"):
+            self.toggle_mode()
+        elif label == "SPEAK":
+            pass
         else:
             self.typed_text += label
-
 
     def select_suggestion(self):
         """
         Auto-complete typed_text with the currently hovered suggestion word.
-
-        ALGORITHM: Replace Partial Word
-        --------------------------------
-        typed_text = "HAPP"
-        suggestion = "HAPPY"
-
-        1. Split typed_text by space: ["HAPP"]
-        2. Drop the last element (the partial word): []
-        3. Rejoin with spaces: ""
-        4. Append suggestion + space: "HAPPY "
-
-        typed_text = "HELLO WOR"
-        suggestion = "WORLD"
-
-        1. Split: ["HELLO", "WOR"]
-        2. Drop last: ["HELLO"]
-        3. Rejoin: "HELLO"
-        4. Append: "HELLO WORLD "   ← note the trailing space (next word starts)
-
-        WHY A TRAILING SPACE?
-        ----------------------
-        After auto-completing "WORLD", the user is starting the NEXT word.
-        The space triggers next-word prediction in the predictor.
-        This matches behavior of every phone keyboard.
         """
         if self.hovered_suggestion is None or not self.hovered_suggestion.word:
             return
+
+        # Sprint 12: Spawn suggestion ripple (golden amber)
+        cx = self.hovered_suggestion.x + self.hovered_suggestion.width // 2
+        cy = self.hovered_suggestion.y + self.hovered_suggestion.height // 2
+        self.spawn_ripple(cx, cy, color=(0, 215, 255))
 
         words = self.typed_text.split(" ")
         words = words[:-1]                    # drop the partial word
@@ -472,59 +595,71 @@ class Keyboard:
     # ── Drawing ───────────────────────────────────────────────────────────────
 
     def draw(self, frame, finger_pos=None, is_speaking: bool = False,
-              session_start: float = None):
+              session_start: float = None, finger_positions: list = None,
+              fps: float = None):
         """
         Render the full keyboard UI: stats → suggestions → text display → keys.
 
-        DRAWING ORDER MATTERS
-        ----------------------
-        1. Stats bar       (topmost visual element, Sprint 8)
-        2. Suggestion bar
-        3. Text display bar
-        4. Keyboard keys
-        5. SPEAK pulse ring (topmost overlay, drawn last, Sprint 8)
+        Sprint 11: Now accepts a list of finger_positions for multi-hand
+        support. Any key under ANY finger gets highlighted.
 
         Parameters
         ----------
-        frame        : np.ndarray   Current video frame
-        finger_pos   : tuple|None   Index finger tip pixel position
-        is_speaking  : bool         True if TTS is currently active (Sprint 8)
-        session_start: float|None   time.time() when typing began, for WPM (Sprint 8)
+        frame          : np.ndarray   Current video frame
+        finger_pos     : tuple|None   Single finger position (backward compat)
+        is_speaking    : bool         True if TTS is currently active
+        session_start  : float|None   time.time() when typing began
+        finger_positions : list|None  List of (x,y) finger tip positions (Sprint 11)
+        fps            : float|None   Current frames-per-second for display (Sprint 11)
         """
-        hov_sug = self.get_hovered_suggestion(finger_pos)
-        hov_key = self.get_hovered_key(finger_pos)
+        # Sprint 11: Merge single finger_pos with multi-hand list
+        all_fingers = []
+        if finger_positions:
+            all_fingers.extend(finger_positions)
+        elif finger_pos is not None:
+            all_fingers.append(finger_pos)
 
-        self._draw_stats_bar(frame, session_start)
+        # Use first finger for suggestion hover (backward compat)
+        primary_finger = all_fingers[0] if all_fingers else None
+        hov_sug = self.get_hovered_suggestion(primary_finger)
+
+        # Collect ALL hovered keys (any finger on any key)
+        hovered_keys_set = set()
+        for fp in all_fingers:
+            for key in self.keys:
+                if key.contains(fp):
+                    hovered_keys_set.add(id(key))
+            for box in self.suggestion_boxes:
+                if box.contains(fp):
+                    hov_sug = box
+
+        self._draw_stats_bar(frame, session_start, fps=fps)
         self._draw_suggestion_bar(frame, hov_sug)
         self._draw_text_display(frame)
 
         for key in self.keys:
-            key.draw(frame, hovered=(key is hov_key))
+            key.draw(frame, hovered=(id(key) in hovered_keys_set))
 
         if is_speaking:
             self._draw_speak_pulse(frame)
+
+        # Sprint 12: Render and update active ripple effects
+        now = time.time()
+        self.ripples = [r for r in self.ripples if not r.is_finished(now)]
+        for r in self.ripples:
+            r.draw(frame, now=now)
 
     def _draw_suggestion_bar(self, frame, hovered_box):
         """Render the 3 suggestion boxes side by side."""
         for box in self.suggestion_boxes:
             box.draw(frame, hovered=(box is hovered_box))
 
-    def _draw_stats_bar(self, frame, session_start: float = None):
+    def _draw_stats_bar(self, frame, session_start: float = None, fps: float = None):
         """
-        Draw a slim stats bar showing word count and WPM.
+        Draw a slim stats bar showing word count, WPM, and FPS.
 
-        WORD COUNT
-        ----------
-        Count words by splitting on spaces and filtering empty strings.
-        "HELLO WORLD " → ["HELLO", "WORLD"] → 2 words.
-
-        WPM (Words Per Minute)
-        ----------------------
-        WPM = (words_typed / elapsed_minutes)
-        Where elapsed_minutes = (now - session_start) / 60.
-        Standard typing test measurement.
-
-        We only show WPM after 10 seconds (avoids wild early spikes).
+        Sprint 11: Added FPS counter to help monitor performance impact
+        of two-hand detection.
         """
         # Background
         cv2.rectangle(
@@ -554,6 +689,11 @@ class Keyboard:
 
         stats_text = f"Words: {word_count}{wpm_str}"
 
+        # Sprint 11: FPS counter on the right side of the stats bar
+        fps_text = ""
+        if fps is not None:
+            fps_text = f"{int(fps)} FPS"
+
         cv2.putText(
             frame,
             stats_text,
@@ -563,6 +703,19 @@ class Keyboard:
             COLOR_STATS_TEXT,
             1,
         )
+
+        # FPS on the right edge
+        if fps_text:
+            (tw, _), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.putText(
+                frame,
+                fps_text,
+                (START_X + KEYBOARD_CANVAS_WIDTH - tw - 12, STATS_BAR_Y2 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 200, 100),  # green FPS color
+                1,
+            )
 
     def _draw_speak_pulse(self, frame):
         """

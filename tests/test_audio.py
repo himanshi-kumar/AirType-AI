@@ -36,12 +36,14 @@ class TestSoundPlayerInit(unittest.TestCase):
         self.assertIsNotNone(player)
 
     def test_all_sounds_pre_synthesized(self):
-        """All 5 sound arrays should exist after __init__."""
+        """All 7 sound arrays should exist after __init__."""
         self.assertIsNotNone(self.player._keypress_sound)
         self.assertIsNotNone(self.player._space_sound)
         self.assertIsNotNone(self.player._backspace_sound)
         self.assertIsNotNone(self.player._suggestion_sound)
         self.assertIsNotNone(self.player._speak_sound)
+        self.assertIsNotNone(self.player._clear_sound)
+        self.assertIsNotNone(self.player._mode_sound)
 
     def test_all_sounds_are_numpy_arrays(self):
         """All pre-synthesized sounds should be np.ndarray instances."""
@@ -51,6 +53,8 @@ class TestSoundPlayerInit(unittest.TestCase):
             self.player._backspace_sound,
             self.player._suggestion_sound,
             self.player._speak_sound,
+            self.player._clear_sound,
+            self.player._mode_sound,
         ]
         for s in sounds:
             self.assertIsInstance(s, np.ndarray)
@@ -63,6 +67,8 @@ class TestSoundPlayerInit(unittest.TestCase):
             self.player._backspace_sound,
             self.player._suggestion_sound,
             self.player._speak_sound,
+            self.player._clear_sound,
+            self.player._mode_sound,
         ]
         for s in sounds:
             self.assertEqual(s.dtype, np.float32)
@@ -152,6 +158,14 @@ class TestSoundPlayerPlayback(unittest.TestCase):
     def test_play_speak_no_error(self):
         """play_speak() should not raise."""
         self.player.play_speak()
+
+    def test_play_clear_no_error(self):
+        """play_clear() should not raise."""
+        self.player.play_clear()
+
+    def test_play_mode_switch_no_error(self):
+        """play_mode_switch() should not raise."""
+        self.player.play_mode_switch()
 
 
 if __name__ == "__main__":

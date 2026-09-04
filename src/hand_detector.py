@@ -1,5 +1,14 @@
 """
-hand_detector.py — Sprint 2: Hand Detection using MediaPipe Tasks API
+hand_detector.py — Sprint 11: Two-Hand Typing Support
+
+WHAT'S NEW IN SPRINT 11
+-----------------------
+Sprint 2:  MediaPipe Tasks API hand landmarker wrapper
+Sprint 10: + EMA landmark smoothing
+Sprint 11: + Two-hand detection (max_hands=2)
+           + Per-hand color coding (cyan for Left, magenta for Right)
+           + get_all_hands() returns landmark data for ALL detected hands
+           + Per-hand independent EMA smoothers
 
 WHY THIS FILE EXISTS
 --------------------
@@ -25,6 +34,7 @@ import mediapipe as mp
 import cv2
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from smoothing import LandmarkSmoother
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +84,7 @@ class HandDetector:
     def __init__(
         self,
         model_path: str = "assets/hand_landmarker.task",
-        max_hands: int = 1,
+        max_hands: int = 2,
         min_detection_confidence: float = 0.7,
         min_tracking_confidence: float = 0.7,
     ):
@@ -83,9 +93,10 @@ class HandDetector:
 
         WHY THESE PARAMETERS?
         ---------------------
-        max_hands=1
-            We only need one hand for keyboard typing. Detecting two costs
-            more compute; keep it minimal.
+        max_hands=2
+            Sprint 11: We track two hands for split-keyboard typing.
+            Both left and right hands can hover over and press keys
+            independently, doubling typing speed potential.
 
         min_detection_confidence=0.7
             Palm detector threshold. Below 0.7 = too many false positives
@@ -160,6 +171,41 @@ class HandDetector:
         # By storing the result on self, any method can read it for free.
         self._last_results = None
 
+        # ── Sprint 10: EMA Landmark Smoother ──────────────────────────────
+        # Applies Exponential Moving Average to raw landmark coordinates
+        # to eliminate 2-5px per-frame jitter from webcam noise.
+        # α = 0.45: good balance between responsiveness and smoothness.
+        # The smoother is applied inside get_landmark_position() only,
+        # so drawn landmarks show raw positions (no visual lag on skeleton)
+        # but the coordinates used for key hover/collision are smoothed.
+        self._smoother = LandmarkSmoother(alpha=0.45)
+
+        # ── Sprint 11: Per-hand smoothers for multi-hand support ────────
+        # Each detected hand gets its own smoother instance keyed by
+        # hand index (0 or 1). This prevents one hand's smoothing
+        # history from interfering with the other's coordinates.
+        self._hand_smoothers: dict = {}
+
+        # ── Sprint 11: Per-hand skeleton colors ────────────────────────
+        # Different colors help the user distinguish which hand is which.
+        # Cyan = left hand (cool tones), Magenta = right hand (warm tones).
+        self._hand_colors = [
+            {  # Hand 0 colors
+                "skeleton": (0, 200, 200),     # cyan
+                "index": (0, 255, 0),          # green
+                "thumb": (0, 255, 255),        # yellow
+                "wrist": (255, 100, 0),        # blue
+                "other": (255, 255, 255),      # white
+            },
+            {  # Hand 1 colors
+                "skeleton": (200, 0, 200),     # magenta
+                "index": (0, 200, 255),        # orange
+                "thumb": (255, 0, 255),        # magenta
+                "wrist": (255, 0, 100),        # pink
+                "other": (220, 200, 255),      # light purple
+            },
+        ]
+
     def detect(self, frame) -> "np.ndarray":
         """
         Detect hands in one BGR frame, draw landmarks, return the frame.
@@ -221,11 +267,13 @@ class HandDetector:
         if results.hand_landmarks:
             h, w, _ = frame.shape  # get pixel dimensions once
 
-            for hand_landmarks in results.hand_landmarks:
+            for hand_idx, hand_landmarks in enumerate(results.hand_landmarks):
+                # Pick color scheme based on hand index (Sprint 11)
+                colors = self._hand_colors[hand_idx % len(self._hand_colors)]
                 # Draw skeleton lines FIRST so landmark dots appear on top
-                self._draw_connections(frame, hand_landmarks, w, h)
+                self._draw_connections(frame, hand_landmarks, w, h, colors)
                 # Draw landmark dots
-                self._draw_landmarks(frame, hand_landmarks, w, h)
+                self._draw_landmarks(frame, hand_landmarks, w, h, colors)
 
         return frame
 
@@ -254,48 +302,44 @@ class HandDetector:
         y = int(landmark.y * height)
         return x, y
 
-    def _draw_landmarks(self, frame, landmarks, width: int, height: int):
+    def _draw_landmarks(self, frame, landmarks, width: int, height: int,
+                        colors: dict = None):
         """
         Draw a colored circle at each of the 21 landmark positions.
 
-        VISUAL DESIGN CHOICES
+        VISUAL DESIGN CHOICES (Sprint 11 — per-hand colors)
         ---------------------
-        INDEX_FINGER_TIP (ID 8) → bright green, larger circle with white ring.
-            This is the "pointer" for keyboard interaction. Make it obvious.
-
-        THUMB_TIP (ID 4) → yellow.
-            Will be used in Sprint 3 for pinch detection (index + thumb).
-
-        WRIST (ID 0) → blue.
-            Anchor/base of the hand skeleton.
-
-        All others → small white dots.
-            Knuckles and mid-segments. Keep them subtle.
+        INDEX_FINGER_TIP (ID 8) → green (hand 0) or orange (hand 1)
+        THUMB_TIP (ID 4) → yellow (hand 0) or magenta (hand 1)
+        WRIST (ID 0) → blue (hand 0) or pink (hand 1)
+        All others → white (hand 0) or light purple (hand 1)
         """
+        if colors is None:
+            colors = self._hand_colors[0]
+
         for idx, landmark in enumerate(landmarks):
             cx, cy = self._landmark_to_pixel(landmark, width, height)
 
             if idx == INDEX_FINGER_TIP:
-                cv2.circle(frame, (cx, cy), 12, (0, 255, 0), -1)       # green fill
-                cv2.circle(frame, (cx, cy), 12, (255, 255, 255), 2)    # white ring
+                cv2.circle(frame, (cx, cy), 12, colors["index"], -1)
+                cv2.circle(frame, (cx, cy), 12, (255, 255, 255), 2)
             elif idx == THUMB_TIP:
-                cv2.circle(frame, (cx, cy), 10, (0, 255, 255), -1)     # yellow fill
+                cv2.circle(frame, (cx, cy), 10, colors["thumb"], -1)
             elif idx == WRIST:
-                cv2.circle(frame, (cx, cy), 8, (255, 100, 0), -1)      # blue fill
+                cv2.circle(frame, (cx, cy), 8, colors["wrist"], -1)
             else:
-                cv2.circle(frame, (cx, cy), 5, (255, 255, 255), -1)    # white fill
+                cv2.circle(frame, (cx, cy), 5, colors["other"], -1)
 
-    def _draw_connections(self, frame, landmarks, width: int, height: int):
+    def _draw_connections(self, frame, landmarks, width: int, height: int,
+                          colors: dict = None):
         """
         Draw lines between landmarks to form the hand skeleton.
 
-        HAND_CONNECTIONS is a set of Connection(start=int, end=int) objects.
-        Each represents one bone/segment of the hand (thumb has 4 bones,
-        each finger has 3, plus 4 palm connections = 21 total, 20 edges).
-
-        We draw in semi-transparent cyan so the skeleton is visible but
-        does not overpower the landmark dots drawn on top.
+        Sprint 11: Uses per-hand color for the skeleton lines.
         """
+        if colors is None:
+            colors = self._hand_colors[0]
+
         for connection in self.HAND_CONNECTIONS:
             start_lm = landmarks[connection.start]
             end_lm = landmarks[connection.end]
@@ -303,7 +347,7 @@ class HandDetector:
             start_pt = self._landmark_to_pixel(start_lm, width, height)
             end_pt = self._landmark_to_pixel(end_lm, width, height)
 
-            cv2.line(frame, start_pt, end_pt, (0, 200, 200), 2)   # cyan line
+            cv2.line(frame, start_pt, end_pt, colors["skeleton"], 2)
 
     def get_landmark_position(self, frame, landmark_id: int):
         """
@@ -334,14 +378,82 @@ class HandDetector:
             Callers MUST check for None before using the result.
         """
         if self._last_results is None:
+            # No hand detected → reset smoother to avoid stale positions
+            self._smoother.reset()
             return None
         if not self._last_results.hand_landmarks:
+            self._smoother.reset()
             return None
 
         # Take the first detected hand (index 0).
-        # We configured max_hands=1 so there's always at most one.
+        # Backward compatible: returns first hand's landmark.
         landmarks = self._last_results.hand_landmarks[0]
 
         h, w, _ = frame.shape
         landmark = landmarks[landmark_id]
-        return self._landmark_to_pixel(landmark, w, h)
+        raw_x, raw_y = self._landmark_to_pixel(landmark, w, h)
+
+        # ── Sprint 10: Apply EMA smoothing ────────────────────────────────
+        smooth_x, smooth_y = self._smoother.update(landmark_id, raw_x, raw_y)
+        return (smooth_x, smooth_y)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # SPRINT 11: MULTI-HAND API
+    # ────────────────────────────────────────────────────────────────────────
+
+    def get_all_hands(self, frame) -> list:
+        """
+        Return smoothed landmark positions for ALL detected hands.
+
+        This is the Sprint 11 multi-hand API. Unlike get_landmark_position()
+        which returns data for only the first hand, this method returns data
+        for every detected hand (up to max_hands=2).
+
+        Each hand gets its own EMA smoother instance to prevent one hand's
+        smoothing history from interfering with the other.
+
+        Returns
+        -------
+        list[dict]   Each dict has:
+            'index_tip' : (int, int) | None   Smoothed index finger position
+            'thumb_tip' : (int, int) | None   Smoothed thumb position
+            'hand_index': int                 0 or 1 (for color identification)
+        """
+        if self._last_results is None or not self._last_results.hand_landmarks:
+            # No hands → clear all per-hand smoothers
+            self._hand_smoothers.clear()
+            return []
+
+        h, w, _ = frame.shape
+        hands = []
+
+        for hand_idx, hand_landmarks in enumerate(self._last_results.hand_landmarks):
+            # Create per-hand smoother on first detection
+            if hand_idx not in self._hand_smoothers:
+                self._hand_smoothers[hand_idx] = LandmarkSmoother(alpha=0.45)
+
+            smoother = self._hand_smoothers[hand_idx]
+
+            # Index finger tip
+            idx_lm = hand_landmarks[INDEX_FINGER_TIP]
+            raw_ix, raw_iy = self._landmark_to_pixel(idx_lm, w, h)
+            smooth_ix, smooth_iy = smoother.update(INDEX_FINGER_TIP, raw_ix, raw_iy)
+
+            # Thumb tip
+            thumb_lm = hand_landmarks[THUMB_TIP]
+            raw_tx, raw_ty = self._landmark_to_pixel(thumb_lm, w, h)
+            smooth_tx, smooth_ty = smoother.update(THUMB_TIP, raw_tx, raw_ty)
+
+            hands.append({
+                "index_tip": (smooth_ix, smooth_iy),
+                "thumb_tip": (smooth_tx, smooth_ty),
+                "hand_index": hand_idx,
+            })
+
+        # Clean up smoothers for hands that disappeared
+        active_indices = set(range(len(self._last_results.hand_landmarks)))
+        stale = [k for k in self._hand_smoothers if k not in active_indices]
+        for k in stale:
+            del self._hand_smoothers[k]
+
+        return hands

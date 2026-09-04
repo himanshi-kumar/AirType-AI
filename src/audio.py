@@ -98,11 +98,13 @@ class SoundPlayer:
         self._backspace_sound  = self._sweep(freq_start=330, freq_end=165, duration=0.07)  # descending
         self._suggestion_sound = self._sweep(freq_start=523, freq_end=784, duration=0.12)  # rising C5→G5
         self._speak_sound      = self._chord(freqs=[440, 550], duration=0.15)              # 440+550Hz
+        self._clear_sound      = self._chord(freqs=[587, 440, 293], duration=0.18)         # Sprint 12: D5+A4+D4 descending chord
+        self._mode_sound       = self._chord(freqs=[523, 659], duration=0.10)              # Sprint 12: C5+E5 chime
 
         # Apply fade-out envelope to all sounds to avoid clicks/pops
         # at the end of each sample (abrupt cutoff creates a "click" artifact)
         for attr in ("_keypress_sound", "_space_sound", "_backspace_sound",
-                     "_suggestion_sound", "_speak_sound"):
+                     "_suggestion_sound", "_speak_sound", "_clear_sound", "_mode_sound"):
             setattr(self, attr, self._apply_fade(getattr(self, attr)))
 
     # ── Sound Synthesis ────────────────────────────────────────────────────────
@@ -251,3 +253,18 @@ class SoundPlayer:
         440+550Hz chord, 150ms — richer than a click to signal a major action.
         """
         sd.play(self._speak_sound, samplerate=SAMPLE_RATE)
+
+    def play_clear(self) -> None:
+        """
+        Play a descending chord when the CLR (clear) key is pinched.
+        D5+A4+D4 chord, 180ms — distinct reset audio signature.
+        """
+        sd.play(self._clear_sound, samplerate=SAMPLE_RATE)
+
+    def play_mode_switch(self) -> None:
+        """
+        Play a crisp dual-tone chime when toggling between ABC and 123 layouts.
+        523+659Hz (C5+E5) chord, 100ms.
+        """
+        sd.play(self._mode_sound, samplerate=SAMPLE_RATE)
+

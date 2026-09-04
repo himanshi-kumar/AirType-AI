@@ -33,6 +33,10 @@ No touch. No physical hardware. Just a standard webcam and your hands.
 | **Sprint 6** | Voice Output (TTS) | Offline `pyttsx3` engine running on background daemon threads | ✅ |
 | **Sprint 7** | Sound Feedback | In-memory NumPy audio synthesis (clicks, chirps, chords) via `sounddevice` | ✅ |
 | **Sprint 8** | Premium UI Polish | Glassmorphism (`cv2.addWeighted`), live WPM telemetry, audio pulse ring | ✅ |
+| **Sprint 9** | BK-Tree & Bayesian Ranking | Metric tree $O(\log N)$ fuzzy search, length filtering, ~2,500 word lexicon | ✅ |
+| **Sprint 10** | EMA Landmark Smoothing | Exponential Moving Average ($\alpha=0.45$) low-pass filter eliminating jitter | ✅ |
+| **Sprint 11** | Two-Hand Typing Support | Concurrent dual-hand tracking, per-hand pinch isolation, real-time FPS gauge | ✅ |
+| **Sprint 12** | Keypad Modes & Ripple FX | `ABC` ↔ `123` layout toggle, `CLR` key, expanding ripple ring animations | ✅ |
 
 ---
 
@@ -94,25 +98,30 @@ AirType-AI/
 │   └── hand_landmarker.task     ← MediaPipe ML model (7.5MB)
 │
 ├── src/
-│   ├── main.py                  ← Central pipeline orchestrator (30fps loop)
-│   ├── hand_detector.py         ← MediaPipe Tasks API hand landmark detector
-│   ├── keyboard.py              ← UI renderer, Key/SuggestionBox classes, glassmorphism
-│   ├── gesture.py               ← PinchDetector (Euclidean distance + rising-edge state machine)
-│   ├── prediction.py            ← WordPredictor (prefix completion, bigram NLP, Damerau-Levenshtein)
+│   ├── main.py                  ← Pipeline orchestrator with dual-hand event dispatch & FPS gauge
+│   ├── hand_detector.py         ← MediaPipe hand landmarker with dual-skeleton visualization & EMA
+│   ├── smoothing.py             ← LandmarkSmoother (Exponential Moving Average DSP filter)
+│   ├── keyboard.py              ← Glassmorphic UI renderer, RippleEffect, and ABC/123 layouts
+│   ├── gesture.py               ← PinchDetector & MultiPinchDetector (independent channel state machines)
+│   ├── prediction.py            ← WordPredictor (BK-Tree metric index, Bayesian ranking, bigram NLP)
 │   ├── speech.py                ← Speaker (offline TTS daemon thread with mutex lock)
 │   └── audio.py                 ← SoundPlayer (in-memory NumPy waveform synthesizer)
 │
 ├── tests/
 │   ├── test_spelling.py         ← 30 tests: DL distance, QWERTY costs, autocorrect
 │   ├── test_speech.py           ← 13 tests: TTS initialization, non-blocking threads, UI keys
-│   ├── test_audio.py            ← 18 tests: waveform math, amplitude bounds, fade envelopes
-│   └── test_ui.py               ← 9 tests: glassmorphic alpha blending, stats bar, pulse ring
+│   ├── test_audio.py            ← 19 tests: waveform math, amplitude bounds, fade envelopes, chords
+│   ├── test_ui.py               ← 9 tests: glassmorphic alpha blending, stats bar, pulse ring
+│   ├── test_bktree.py           ← 32 tests: BK-Tree metric indexing, Bayesian scoring, length filter
+│   ├── test_smoothing.py        ← 17 tests: EMA filter convergence, step response, jitter reduction
+│   ├── test_multihand.py        ← 13 tests: two-hand tracking, independent cooldowns, FPS counter
+│   └── test_ripple.py           ← 19 tests: RippleEffect mathematics, layout modes, CLR key
 │
 ├── docs/
-│   ├── engineering-journal/     ← Daily technical write-ups (Day-01.md to Day-09.md)
+│   ├── engineering-journal/     ← Daily technical write-ups (Day-01.md to Day-13.md)
 │   └── notes/                   ← Architecture & sprint specs
 │
-├── CHANGELOG.md                 ← Version release history (v0.1.0 to v0.8.0)
+├── CHANGELOG.md                 ← Version release history (v0.1.0 to v0.12.0)
 ├── requirements.txt             ← Pinned project dependencies
 └── README.md
 ```
@@ -124,29 +133,32 @@ AirType-AI/
 ```mermaid
 flowchart TD
     A[Webcam Feed 1280x720] --> B[Frame Preprocessing & Mirror]
-    B --> C[MediaPipe HandLandmarker]
-    C --> D[Extract Index & Thumb 3D Coordinates]
+    B --> C[MediaPipe HandLandmarker - Dual Hand]
+    C --> D[Extract Index & Thumb Coordinates]
+    D --> E[EMA Landmark Low-Pass Filter]
     
-    D --> E[PinchDetector State Machine]
-    D --> F[Keyboard AABB Collision & Hover]
+    E --> F[MultiPinchDetector Independent State Machines]
+    E --> G[Keyboard AABB Collision & Multi-Finger Hover]
     
     subgraph Language & Audio Engines
-        G[WordPredictor: Prefix + Bigram + Damerau-Levenshtein]
-        H[SoundPlayer: Synthesized Audio Waveforms]
-        I[Speaker: Daemon Thread Offline TTS]
+        H[WordPredictor: BK-Tree + Bayesian Ranking + Bigram]
+        I[SoundPlayer: Synthesized Audio Waveforms]
+        J[Speaker: Daemon Thread Offline TTS]
     end
     
-    E -- "Click Event" --> J{Action Dispatcher}
-    J -- "Suggestion Hovered" --> K[Auto-complete Word + Rising Chime]
-    J -- "SPEAK Key Hovered" --> L[Trigger TTS Speech + Chord FX]
-    J -- "SPACE Hovered" --> M[Auto-correct Last Word + Append Space + Thud FX]
-    J -- "BACK Hovered" --> N[Delete Character + Descending Blip FX]
-    J -- "Letter Hovered" --> O[Append Letter + Click FX]
+    F -- "Click Event" --> K{Action Dispatcher}
+    K -- "Suggestion Hovered" --> L[Auto-complete Word + Rising Chime + Amber Ripple]
+    K -- "SPEAK Key" --> M[Trigger TTS Speech + Chord FX + Orange Pulse]
+    K -- "SPACE Key" --> N[Bayesian Auto-correct + Append Space + Thud FX]
+    K -- "BACK Key" --> O[Delete Character + Descending Blip FX]
+    K -- "CLR Key" --> P[Clear Typed Buffer + Triad Chord FX]
+    K -- "123 / ABC Key" --> Q[Toggle Layout Mode + Chime FX]
+    K -- "Letter/Symbol Key" --> R[Append Character + Click FX + Cyan Ripple]
     
-    F --> P[Keyboard Glassmorphic Renderer]
-    G --> P
-    I --> P
-    P --> Q[OpenCV Frame Output with Live WPM Stats]
+    G --> S[Keyboard Glassmorphic Renderer]
+    H --> S
+    J --> S
+    S --> T[OpenCV Frame Output with Live WPM & FPS Stats]
 ```
 
 ---
@@ -155,6 +167,11 @@ flowchart TD
 
 | Innovation / Algorithm | Problem Solved | Implementation Detail |
 |------------------------|----------------|-----------------------|
+| **BK-Tree Metric Index** | $O(N)$ vocabulary search bottlenecks | Burkhard-Keller metric tree leveraging triangle inequality to prune 90%+ of edit distance calculations in $O(\log N)$ time. |
+| **Bayesian Ranking Model** | Ambiguous spelling candidate selection | Combines edit distance with empirical word log-frequency: $\text{score} = d - \alpha \ln(f + 1)$ to break ties toward natural vocabulary. |
+| **EMA Landmark Smoothing** | Optical tremor and landmark jitter | First-order Infinite Impulse Response (IIR) low-pass filter: $\hat{x}_t = \alpha x_t + (1-\alpha)\hat{x}_{t-1}$ with zero latency penalty. |
+| **Multi-Hand Isolation** | Shared cooldown delays in two-hand typing | Discrete `MultiPinchDetector` instances per hand tracking independent rising-edge thresholds and cooldown clocks. |
+| **Parametric Ripple Animation** | Lack of tactile feedback on touchless keyboards | Expanding circles with linear alpha decay: $r = R_{\max}(t/\Delta t)$, $\alpha = \alpha_{\max}(1 - t/\Delta t)$ with bounded ROI compositing. |
 | **QWERTY Substitution Cost** | Physical adjacency errors in air typing | Calculates Euclidean distance between key centers; adjacent substitutions (W→E) cost $\approx 0.79$, while distant keys cost up to $1.80$. |
 | **Damerau-Levenshtein Distance** | Common transpositions (`HPAP` $\rightarrow$ `HAPPY`) | 2D dynamic programming supporting insertions, deletions, substitutions, and character swaps with first-letter mismatch penalty. |
 | **Rising-Edge Pinch Filter** | Accidental multi-clicks on pinch holds | State machine triggering strictly on the transition from `not_pinching` to `pinching` with a 20-frame cooldown counter. |
@@ -177,20 +194,24 @@ Documenting the entire journey from mathematical derivations to real-time CV int
 - 📘 [Day 07](docs/engineering-journal/Day-07.md): Asynchronous TTS architecture and thread safety with mutex locks.
 - 📘 [Day 08](docs/engineering-journal/Day-08.md): DSP audio synthesis (sine waves, linear chirps, superposition).
 - 📘 [Day 09](docs/engineering-journal/Day-09.md): Glassmorphic alpha compositing and parametric visual animations.
+- 📘 [Day 10](docs/engineering-journal/Day-10.md): Burkhard-Keller (BK-Tree) indexing, triangle inequality pruning, and Bayesian rankers.
+- 📘 [Day 11](docs/engineering-journal/Day-11.md): Digital signal processing, Exponential Moving Average low-pass filters, and jitter elimination.
+- 📘 [Day 12](docs/engineering-journal/Day-12.md): Concurrent dual-hand tracking, per-hand gesture isolation, and rolling-window FPS counters.
+- 📘 [Day 13](docs/engineering-journal/Day-13.md): Keypad layout switching, sub-frame ROI alpha blending, and ripple animation lifecycles.
 
 ---
 
 ## 🧪 Testing & Verification
 
-AirType AI includes a test suite covering all modules:
+AirType AI includes a comprehensive test suite covering all modules:
 
 ```bash
-# Run all 69 unit tests
+# Run all 152 unit tests
 .venv/bin/python -m unittest discover tests -v
 ```
 
 ```
-Ran 69 tests in 1.376s
+Ran 152 tests in 2.975s
 
 OK (100% Passing)
 ```

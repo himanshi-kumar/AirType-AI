@@ -1,28 +1,36 @@
 """
-main.py — Sprint 8: Full AirType AI Pipeline with Premium UI Polish
+main.py — Sprint 12: Number/Symbol Keypad Toggle & Visual Ripple
 
-WHAT CHANGED FROM SPRINT 7
----------------------------
-Sprint 7: + SoundPlayer with synthesized audio cues (click, thud, blip, chime, chord)
-Sprint 8: + Glassmorphism translucent key styling
-          + Real-time typing stats bar (word count + WPM)
-          + Visual audio pulse ring around SPEAK key during speech synthesis
+WHAT CHANGED
+------------
+Sprint 8:  + Glassmorphism, stats bar, SPEAK pulse
+Sprint 11: + Two-hand detection (each hand is an independent typing channel)
+           + MultiPinchDetector for per-hand cooldown
+           + FPS counter in stats bar
+Sprint 12: + Keypad mode toggle (ABC <-> 123) with dual-tone chime
+           + CLR (clear) key with descending reset chord
+           + Dynamic ripple animations on every pinch click
 
-PRIORITY ORDER IN PINCH HANDLING
-----------------------------------
-When a pinch fires, we check in this order:
-    1. Is the finger over a SUGGESTION BOX? → auto-complete + play chime
-    2. Is the finger over the SPEAK key?    → speak text + play chord
-    3. Is the finger over SPC?              → auto-correct + append space + play thud
-    4. Is the finger over BACK?             → delete char + play blip
-    5. Is the finger over a letter?         → append letter + play click
+MULTI-HAND ARCHITECTURE
+-------------------------
+1. detector.get_all_hands(frame) returns a list of hand dicts.
+2. Each hand dict contains smoothed index_tip, thumb_tip, and hand_index.
+3. MultiPinchDetector tracks rising-edge + cooldown per hand independently.
+4. Keyboard.draw() highlights keys under ANY finger from any hand.
+5. When either hand pinches a key, the corresponding action fires.
+
+FPS COUNTER
+-----------
+Measures real loop throughput using a rolling window of frame timestamps.
+Displayed in the stats bar (top-right) so users can monitor performance
+impact of two-hand detection.
 """
 
 import time
 import cv2
 from hand_detector import HandDetector, INDEX_FINGER_TIP, THUMB_TIP
 from keyboard import Keyboard
-from gesture import PinchDetector
+from gesture import PinchDetector, MultiPinchDetector
 from prediction import WordPredictor
 from speech import Speaker
 from audio import SoundPlayer
@@ -38,13 +46,20 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-detector      = HandDetector()      # loads MediaPipe 7.5MB model once
-keyboard      = Keyboard()          # creates all Key and SuggestionBox objects
-pinch         = PinchDetector()     # stateful rising-edge + cooldown tracker
-predictor     = WordPredictor()     # frequency dictionary + bigram table (instant, no files)
-speaker       = Speaker()           # TTS engine — background thread, non-blocking
-audio         = SoundPlayer()       # sound feedback — pre-synthesized, non-blocking
-session_start = time.time()         # timestamp when typing session begins
+detector      = HandDetector()          # loads MediaPipe model once (max_hands=2)
+keyboard      = Keyboard()              # all Key + SuggestionBox objects
+multi_pinch   = MultiPinchDetector()    # Sprint 11: per-hand pinch detection
+predictor     = WordPredictor()         # BK-Tree + Bayesian autocorrect (Sprint 9)
+speaker       = Speaker()              # TTS engine — background thread
+audio         = SoundPlayer()          # synthesized audio cues
+session_start = time.time()            # typing session start
+
+# FPS tracking: rolling window of recent frame timestamps
+_fps_timestamps = []
+_current_fps = 0.0
+
+# Backward-compatible: keep a single PinchDetector for fallback
+pinch = PinchDetector()
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -57,13 +72,6 @@ while True:
         break
 
     # ── Step 2: Normalize resolution ──────────────────────────────────────────
-    # Even if the webcam can't deliver 1280×720, we resize the frame here.
-    # All subsequent coordinate calculations assume FRAME_WIDTH × FRAME_HEIGHT.
-    # Without this, landmark pixel positions wouldn't match key positions.
-    #
-    # cv2.resize interpolation:
-    #   INTER_LINEAR = bilinear interpolation (good quality, fast)
-    #   INTER_NEAREST = nearest-neighbour (fast, pixelated — avoid for display)
     if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
         frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_LINEAR)
 
@@ -73,63 +81,96 @@ while True:
     # ── Step 4: Hand detection (ML inference) ─────────────────────────────────
     frame = detector.detect(frame)
 
-    # ── Step 5: Get finger positions from cached result ────────────────────────
-    index_tip = detector.get_landmark_position(frame, INDEX_FINGER_TIP)
-    thumb_tip  = detector.get_landmark_position(frame, THUMB_TIP)
+    # ── Step 5: FPS measurement ───────────────────────────────────────────────
+    # Rolling window: keep timestamps from the last 30 frames.
+    # FPS = number_of_frames / time_span
+    now = time.time()
+    _fps_timestamps.append(now)
+    if len(_fps_timestamps) > 30:
+        _fps_timestamps.pop(0)
+    if len(_fps_timestamps) >= 2:
+        elapsed = _fps_timestamps[-1] - _fps_timestamps[0]
+        if elapsed > 0:
+            _current_fps = (len(_fps_timestamps) - 1) / elapsed
 
-    # ── Step 6: Word prediction ───────────────────────────────────────────────
-    # Compute suggestions from the current typed text.
-    # This runs every frame — it's a dictionary lookup, not ML inference.
-    # Time cost: ~0.01ms. Negligible at 30fps.
-    #
-    # WHY EVERY FRAME?
-    # Because typed_text changes whenever a pinch fires (previous step).
-    # If we only updated predictions on pinch, the suggestion bar would
-    # lag one frame behind. Updating every frame keeps it always current.
+    # ── Step 6: Multi-hand processing (Sprint 11) ─────────────────────────────
+    # Get all detected hands (up to 2) with smoothed landmark positions.
+    hands = detector.get_all_hands(frame)
+
+    # Collect all finger tip positions for keyboard drawing
+    finger_positions = [h["index_tip"] for h in hands if h["index_tip"]]
+
+    # Also maintain backward-compatible single-hand variables
+    index_tip = hands[0]["index_tip"] if hands else None
+    thumb_tip = hands[0]["thumb_tip"] if hands else None
+
+    # ── Step 7: Word prediction ───────────────────────────────────────────────
     suggestions = predictor.get_suggestions(keyboard.typed_text)
     keyboard.set_suggestions(suggestions)
 
-    # ── Step 7: Draw keyboard + suggestions + UI overlays ─────────────────────
-    # Keyboard.draw() handles all rendering:
-    #   - Stats bar (word count, WPM)
-    #   - Suggestion bar (3 blue boxes with predicted words)
-    #   - Typed text display bar
-    #   - All keyboard keys (glassmorphism translucent effect)
-    #   - SPEAK pulsing ring when active
+    # ── Step 8: Draw keyboard + suggestions + UI overlays ─────────────────────
     keyboard.draw(
         frame,
-        finger_pos=index_tip,
+        finger_pos=index_tip,             # backward compat
         is_speaking=speaker.is_speaking,
         session_start=session_start,
+        finger_positions=finger_positions, # Sprint 11: all fingers
+        fps=_current_fps,                  # Sprint 11: FPS display
     )
 
-    # ── Step 8: Pinch detection and action ────────────────────────────────────
-    clicked = pinch.update(index_tip, thumb_tip)
+    # ── Step 9: Multi-hand pinch detection and action ─────────────────────────
+    # Check each hand independently for pinch events.
+    active_hand_indices = set()
 
-    if clicked:
-        # PRIORITY: suggestion first, SPEAK second, key third
-        if keyboard.hovered_suggestion:
-            keyboard.select_suggestion()
-            audio.play_suggestion()                          # rising chime
-        elif keyboard.hovered_key and keyboard.hovered_key.label == "SPEAK":
-            # ── Sprint 6: Speak typed text aloud ───────────────────────
-            speaker.speak(keyboard.typed_text)
-            audio.play_speak()                               # activation chord
-        elif keyboard.hovered_key:
-            label = keyboard.hovered_key.label
-            keyboard.register_click(predictor)
-            # ── Sprint 7: Sound per key type ────────────────────────────
-            if label == "SPC":
-                audio.play_space()                           # deep thud
-            elif label == "BACK":
-                audio.play_backspace()                       # descending blip
-            else:
-                audio.play_keypress()                        # short click
+    for hand_data in hands:
+        hand_idx = hand_data["hand_index"]
+        active_hand_indices.add(hand_idx)
 
-    # ── Step 9: Display ───────────────────────────────────────────────────────
+        clicked = multi_pinch.update(
+            hand_idx,
+            hand_data["index_tip"],
+            hand_data["thumb_tip"],
+        )
+
+        if clicked:
+            # Use this hand's index finger for hover detection
+            this_finger = hand_data["index_tip"]
+
+            # Check what this finger is hovering over
+            hov_sug = keyboard.get_hovered_suggestion(this_finger)
+            hov_key = keyboard.get_hovered_key(this_finger)
+
+            # PRIORITY: suggestion first, SPEAK second, key third
+            if hov_sug and hov_sug.word:
+                keyboard.hovered_suggestion = hov_sug
+                keyboard.select_suggestion()
+                audio.play_suggestion()                          # rising chime
+            elif hov_key and hov_key.label == "SPEAK":
+                speaker.speak(keyboard.typed_text)
+                audio.play_speak()                               # activation chord
+            elif hov_key:
+                label = hov_key.label
+                keyboard.hovered_key = hov_key
+                keyboard.register_click(predictor)
+                # Sound per key type
+                if label == "SPC":
+                    audio.play_space()                           # deep thud
+                elif label == "BACK":
+                    audio.play_backspace()                       # descending blip
+                elif label == "CLR":
+                    audio.play_clear()                           # descending chord (Sprint 12)
+                elif label in ("123", "ABC"):
+                    audio.play_mode_switch()                     # dual-tone chime (Sprint 12)
+                else:
+                    audio.play_keypress()                        # short click
+
+    # Tick cooldowns for hands that weren't detected this frame
+    multi_pinch.tick_inactive(active_hand_indices)
+
+    # ── Step 10: Display ──────────────────────────────────────────────────────
     cv2.imshow("AirType AI", frame)
 
-    # ── Step 10: Quit ─────────────────────────────────────────────────────────
+    # ── Step 11: Quit ─────────────────────────────────────────────────────────
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 

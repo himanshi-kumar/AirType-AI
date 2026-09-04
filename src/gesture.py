@@ -191,3 +191,104 @@ class PinchDetector:
         Python properties are the standard way to expose computed read-only state.
         """
         return self._was_pinching
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SPRINT 11: MULTI-HAND PINCH DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MultiPinchDetector:
+    """
+    Manages independent PinchDetectors for multiple hands.
+
+    WHY THIS CLASS?
+    ----------------
+    With two-hand typing, each hand needs its own cooldown and rising-edge
+    state. If we shared a single PinchDetector, pinching with the left hand
+    would block the right hand's cooldown timer.
+
+    MultiPinchDetector creates PinchDetector instances lazily for each hand
+    index and delegates update() calls to the correct one.
+
+    USAGE
+    ------
+    multi = MultiPinchDetector()
+
+    for hand_data in detector.get_all_hands(frame):
+        clicked = multi.update(
+            hand_data['hand_index'],
+            hand_data['index_tip'],
+            hand_data['thumb_tip']
+        )
+        if clicked:
+            # This hand just clicked!
+            key = keyboard.get_key_at(hand_data['index_tip'])
+
+    ATTRIBUTES
+    ----------
+    _detectors : dict[int, PinchDetector]
+        Maps hand_index → dedicated PinchDetector instance.
+    threshold : int
+        Pinch threshold passed to each child PinchDetector.
+    """
+
+    def __init__(self, threshold: int = PINCH_THRESHOLD):
+        self.threshold = threshold
+        self._detectors: dict = {}
+
+    def update(self, hand_index: int, index_tip, thumb_tip) -> bool:
+        """
+        Process pinch for a specific hand. Returns True on click.
+
+        Lazily creates a PinchDetector for each new hand_index.
+        Delegates to the appropriate hand's detector for independent
+        cooldown and rising-edge tracking.
+
+        Parameters
+        ----------
+        hand_index : int
+            Which hand (0 or 1).
+        index_tip : (int, int) | None
+            Index finger tip position.
+        thumb_tip : (int, int) | None
+            Thumb tip position.
+
+        Returns
+        -------
+        bool   True if this hand clicked this frame.
+        """
+        if hand_index not in self._detectors:
+            self._detectors[hand_index] = PinchDetector(
+                threshold=self.threshold
+            )
+        return self._detectors[hand_index].update(index_tip, thumb_tip)
+
+    def tick_inactive(self, active_indices: set) -> None:
+        """
+        Decrement cooldowns for hands that are NOT in the current frame
+        but still have active detectors (e.g., hand briefly left the frame).
+
+        Also resets detectors for hands that haven't been seen in a while.
+
+        Parameters
+        ----------
+        active_indices : set[int]
+            Hand indices that were detected this frame.
+        """
+        stale = []
+        for idx, det in self._detectors.items():
+            if idx not in active_indices:
+                # Hand not visible — reset its pinch state
+                det._was_pinching = False
+                if det.cooldown > 0:
+                    det.cooldown -= 1
+                stale.append(idx)
+
+        # Clean up detectors for hands that have been gone for a while
+        for idx in stale:
+            if self._detectors[idx].cooldown == 0:
+                del self._detectors[idx]
+
+    def is_any_pinching(self) -> bool:
+        """Return True if ANY hand is currently in a pinch state."""
+        return any(d.is_pinching for d in self._detectors.values())
